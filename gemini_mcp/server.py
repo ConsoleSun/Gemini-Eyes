@@ -45,12 +45,16 @@ _client: Optional[GeminiWebClient] = None
 _browser: str = "chrome"
 _profile: str = "Default"
 _language: str = "zh-CN"
+_cookie_file: Optional[str] = None
 _metadata_cache: dict[str, list[Any]] = {}  # conversation_id -> metadata
+
+# How often to rotate __Secure-1PSIDTS in the background (seconds).
+_ROTATE_INTERVAL = 25 * 60
 
 
 def _load_cookies() -> tuple[dict[str, str], list[str]]:
     """Load cookies: explicit file first, then auto-extract from browser."""
-    cookie_file = os.environ.get("GEMINI_COOKIE_FILE")
+    cookie_file = _cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
     if cookie_file and Path(cookie_file).is_file():
         raw = json.loads(Path(cookie_file).read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -71,6 +75,46 @@ def _get_client() -> GeminiWebClient:
         )
     _client = GeminiWebClient(cookies, language=_language)
     return _client
+
+
+def _persist_cookies(client: GeminiWebClient) -> None:
+    """Write the (rotated) session cookies back to the cookie file, so a
+    process restart keeps using fresh cookies."""
+    path = _cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
+    if not path:
+        return
+    entries = []
+    for cookie in client.session.cookies:
+        if "google.com" in (cookie.domain or ""):
+            entries.append(
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain,
+                    "path": cookie.path or "/",
+                }
+            )
+    if entries:
+        try:
+            Path(path).write_text(
+                json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.chmod(path, 0o600)
+            log.info("Rotated cookies persisted to %s (%d cookies)", path, len(entries))
+        except OSError as e:
+            log.warning("Failed to persist rotated cookies: %s", e)
+
+
+def _auto_rotate_loop() -> None:
+    """Background daemon: renew the short-lived 1PSIDTS cookie periodically."""
+    while True:
+        time.sleep(_ROTATE_INTERVAL)
+        try:
+            client = _get_client()
+            if client.rotate_cookies(force=True):
+                _persist_cookies(client)
+        except Exception:  # noqa: BLE001 - keep the loop alive
+            log.warning("Background cookie rotation failed", exc_info=True)
 
 
 def _metadata_for(conversation_id: Optional[str], response_id: Optional[str]) -> Optional[list[Any]]:
@@ -162,6 +206,14 @@ def gemini_status() -> dict[str, Any]:
         status["token_fetched"] = True
         status["language"] = client.language
         status["session_id_present"] = bool(client.session_id)
+        status["cookie_rotation"] = {
+            "last_rotate_seconds_ago": (
+                round(time.time() - client._last_rotate_at)
+                if client._last_rotate_at else None
+            ),
+            "interval_seconds": _ROTATE_INTERVAL,
+            "persist_to": _cookie_file or os.environ.get("GEMINI_COOKIE_FILE"),
+        }
     except Exception as e:  # noqa: BLE001 - diagnostics tool must not crash
         status["errors"] = [str(e)]
     return status
@@ -412,7 +464,7 @@ def gemini_delete_conversation(conversation_id: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def main(argv: Optional[list[str]] = None) -> None:
-    global _browser, _profile, _language
+    global _browser, _profile, _language, _cookie_file
 
     parser = argparse.ArgumentParser(
         prog="gemini-mcp",
@@ -439,7 +491,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     if args.cookie_file:
         os.environ["GEMINI_COOKIE_FILE"] = args.cookie_file
+    _cookie_file = args.cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
     _browser, _profile, _language = args.browser, args.profile, args.language
+
+    # Background daemon keeps the short-lived __Secure-1PSIDTS fresh by
+    # rotating it through accounts.google.com/RotateCookies every 25 minutes
+    # and persisting the new cookies back to the cookie file.
+    import threading
+
+    threading.Thread(target=_auto_rotate_loop, daemon=True, name="gemini-cookie-rotator").start()
 
     if args.transport == "http":
         import asyncio

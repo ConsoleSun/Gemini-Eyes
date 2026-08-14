@@ -4,6 +4,7 @@ request construction and conversation RPCs (no network needed)."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -176,6 +177,9 @@ def test_generate_uses_browser_shaped_request(monkeypatch):
         def set(self, *a, **k):
             pass
 
+        def __iter__(self):
+            return iter(())
+
     class _FakeInitResponse:
         status_code = 200
         text = 'window.WIZ_global_data = {"SNlM0e":"tok123","cfb2h":"bl123","FdrFJe":"sid123"}'
@@ -207,7 +211,7 @@ def test_generate_continues_conversation(monkeypatch):
 
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         def get(self, url, **kw):
@@ -241,7 +245,7 @@ def test_generate_non_200_raises(monkeypatch):
 
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         def get(self, url, **kw):
@@ -276,7 +280,7 @@ def test_list_conversations_parses(monkeypatch):
 
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         def get(self, url, **kw):
@@ -304,7 +308,7 @@ def test_delete_conversation_uses_both_rpcs(monkeypatch):
 
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         def get(self, url, **kw):
@@ -323,7 +327,7 @@ def test_delete_conversation_uses_both_rpcs(monkeypatch):
 def test_init_requires_snlm0e():
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         def get(self, url, **kw):
@@ -351,7 +355,7 @@ def test_upload_file_two_phase_resumable(monkeypatch, tmp_path):
 
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         def get(self, url, **kw):
@@ -400,7 +404,7 @@ def test_generate_with_files_embeds_file_data(monkeypatch, tmp_path):
 
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         def get(self, url, **kw):
@@ -464,7 +468,7 @@ def test_download_media_saves_file(monkeypatch, tmp_path):
 
     class FakeSession:
         def __init__(self):
-            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.cookies = type("J", (), {"set": lambda *a, **k: None, "__iter__": lambda self: iter(())})()
             self.headers = {}
 
         class MediaResponse:
@@ -492,3 +496,164 @@ def test_download_media_saves_file(monkeypatch, tmp_path):
     assert captured["url"] == "http://googleusercontent.com/img.png"
     assert Path(dest).read_bytes() == b"\x89PNG-data"
     assert dest.endswith(".png")  # extension inferred from content-type
+
+
+# ---------------------------------------------------------------------------
+# Cookie rotation (RotateCookies)
+# ---------------------------------------------------------------------------
+
+def test_rotate_cookies_posts_and_updates_jar(monkeypatch):
+    captured = {}
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type(
+                "J",
+                (),
+                {
+                    "set": lambda *a, **k: None,
+                    "__iter__": lambda self: iter([
+                        type("C", (), {"name": "__Secure-1PSID", "value": "psid-1",
+                                        "domain": ".google.com", "path": "/"}),
+                        type("C", (), {"name": "__Secure-1PSIDTS", "value": "ts-1",
+                                        "domain": ".google.com", "path": "/"}),
+                    ]),
+                },
+            )()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"t"}'})()
+
+        def post(self, url, headers=None, data=None, **kw):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["data"] = data
+            return type("R", (), {"status_code": 200, "text": ""})()
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    # __Secure-1PSID present -> rotation proceeds
+    client.session.cookies = FakeSession().cookies
+    ok = client.rotate_cookies(force=True)
+    assert ok is True
+    assert captured["url"] == "https://accounts.google.com/RotateCookies"
+    assert captured["headers"]["Content-Type"] == "application/json"
+    assert captured["headers"]["Origin"] == "https://accounts.google.com"
+    assert captured["data"] == '[000,"-0000000000000000000"]'
+
+
+def test_rotate_cookies_skips_without_1psid(monkeypatch):
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type(
+                "J", (), {"__iter__": lambda self: iter([])}
+            )()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"t"}'})()
+
+        def post(self, url, **kw):
+            raise AssertionError("should not POST without __Secure-1PSID")
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    client.session.cookies = FakeSession().cookies
+    assert client.rotate_cookies(force=True) is False
+
+
+def test_rotate_cookies_401_returns_false(monkeypatch):
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type(
+                "J",
+                (),
+                {
+                    "__iter__": lambda self: iter([
+                        type("C", (), {"name": "__Secure-1PSID", "value": "x",
+                                        "domain": ".google.com", "path": "/"}),
+                    ]),
+                },
+            )()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"t"}'})()
+
+        def post(self, url, **kw):
+            return type("R", (), {"status_code": 401, "text": ""})()
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    client.session.cookies = FakeSession().cookies
+    assert client.rotate_cookies(force=True) is False
+
+
+def test_init_retries_after_rotation(monkeypatch):
+    """init() failing to parse SNlM0e should rotate once and retry."""
+    calls = {"get": 0}
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type(
+                "J",
+                (),
+                {
+                    "set": lambda *a, **k: None,
+                    "__iter__": lambda self: iter([
+                        type("C", (), {"name": "__Secure-1PSID", "value": "x",
+                                        "domain": ".google.com", "path": "/"}),
+                        type("C", (), {"name": "__Secure-1PSIDTS", "value": "y",
+                                        "domain": ".google.com", "path": "/"}),
+                    ]),
+                },
+            )()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            calls["get"] += 1
+            if calls["get"] == 1:
+                return type("R", (), {"status_code": 200, "text": "<html>no token</html>"})()
+            return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"tok-ok"}'})()
+
+        def post(self, url, **kw):
+            return type("R", (), {"status_code": 200, "text": ""})()
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    client.session.cookies = FakeSession().cookies
+    client.init(force=True)
+    assert calls["get"] == 2
+    assert client.access_token == "tok-ok"
+
+
+def test_ensure_fresh_rotates_after_interval(monkeypatch):
+    client = GeminiWebClient({})
+    client._last_rotate_at = time.time() - 2000  # older than 1500s threshold
+    rotated = []
+    client.rotate_cookies = lambda force=False: rotated.append(force) or True
+    client.ensure_fresh()
+    assert rotated == [False]
+    # fresh -> no rotation
+    client._last_rotate_at = time.time()
+    client.ensure_fresh()
+    assert len(rotated) == 1
+
+
+def test_persist_cookies_writes_file(monkeypatch, tmp_path):
+    import gemini_mcp.server as server
+
+    cookie_file = tmp_path / "cookies.json"
+    monkeypatch.setattr(server, "_cookie_file", str(cookie_file))
+
+    client = GeminiWebClient({})
+    client.session.cookies.set("__Secure-1PSID", "v1", domain=".google.com", path="/")
+    client.session.cookies.set("NID", "v2", domain=".google.com", path="/")
+    client.session.cookies.set("other", "v3", domain="example.org", path="/")
+
+    server._persist_cookies(client)
+    raw = json.loads(cookie_file.read_text(encoding="utf-8"))
+    names = {c["name"] for c in raw}
+    assert names == {"__Secure-1PSID", "NID"}  # google cookies only
+    assert (cookie_file.stat().st_mode & 0o777) == 0o600

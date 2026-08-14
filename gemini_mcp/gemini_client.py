@@ -34,6 +34,7 @@ GENERATE_URL = (
 BATCH_EXEC_URL = f"{BASE_URL}/_/BardChatUi/data/batchexecute"
 UPLOAD_URL = "https://push.clients6.google.com/upload"
 PUSH_ID = "feeds/mcudyrk2a4khkz"
+ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies"
 
 # File-type integer used inside the StreamGenerate file entry (web app enum).
 FILES_ENUM_INT = {
@@ -226,6 +227,7 @@ class GeminiWebClient:
         self.build_label: Optional[str] = None
         self.session_id: Optional[str] = None
         self._token_fetched_at: float = 0.0
+        self._last_rotate_at: float = 0.0
         self._reqid = random.randint(10000, 99999)
 
     # ------------------------------------------------------------------
@@ -233,9 +235,25 @@ class GeminiWebClient:
     # ------------------------------------------------------------------
 
     def init(self, force: bool = False) -> None:
-        """Fetch SNlM0e / cfb2h / FdrFJe from the web app (cache with TTL)."""
+        """Fetch SNlM0e / cfb2h / FdrFJe from the web app (cache with TTL).
+
+        When the token cannot be parsed (usually a stale 1PSIDTS), rotate the
+        session cookies once and retry before giving up.
+        """
         if not force and self.access_token and time.time() - self._token_fetched_at < self.token_ttl:
             return
+        try:
+            self._fetch_tokens()
+        except GeminiWebError:
+            if self.rotate_cookies(force=True):
+                try:
+                    self._fetch_tokens()
+                    return
+                except GeminiWebError:
+                    pass
+            raise
+
+    def _fetch_tokens(self) -> None:
         resp = self.session.get(INIT_URL, timeout=self.timeout)
         if resp.status_code != 200:
             raise GeminiWebError(
@@ -255,6 +273,56 @@ class GeminiWebClient:
         self.build_label = bl.group(1) if bl else None
         self.session_id = sid.group(1) if sid else None
         self._token_fetched_at = time.time()
+
+    # ------------------------------------------------------------------
+    # __Secure-1PSIDTS auto-rotation
+    # ------------------------------------------------------------------
+
+    def rotate_cookies(self, force: bool = False) -> bool:
+        """Refresh __Secure-1PSIDTS via accounts.google.com/RotateCookies.
+
+        Google issues 1PSIDTS as a short-lived token; the RotateCookies
+        endpoint exchanges the current session for a fresh set of cookies
+        (including a new 1PSIDTS) via Set-Cookie. Returns True when the
+        jar now holds a (possibly new) 1PSIDTS. A 60s cooldown avoids 429s.
+        """
+        if not force and time.time() - self._last_rotate_at < 60:
+            return self.get_cookie("__Secure-1PSIDTS") is not None
+        if not self.get_cookie("__Secure-1PSID"):
+            return False
+        headers = {
+            "Content-Type": "application/json",
+            "Origin": "https://accounts.google.com",
+            "Referer": "https://accounts.google.com/",
+        }
+        try:
+            resp = self.session.post(
+                ROTATE_COOKIES_URL,
+                headers=headers,
+                data='[000,"-0000000000000000000"]',
+                timeout=self.timeout,
+            )
+            self._last_rotate_at = time.time()
+            if resp.status_code == 401 or resp.status_code >= 400:
+                return False
+            # The server answered with Set-Cookie headers; requests already
+            # merged them into the session jar. Verify we still hold a token.
+            return self.get_cookie("__Secure-1PSIDTS") is not None
+        except requests.RequestException:
+            return False
+
+    def get_cookie(self, name: str) -> Optional[str]:
+        """Read one cookie from the session jar."""
+        for cookie in self.session.cookies:
+            if cookie.name == name:
+                return cookie.value
+        return None
+
+    def ensure_fresh(self, force: bool = False) -> None:
+        """Rotate the session cookie BEFORE requesting tokens, so the
+        short-lived 1PSIDTS is periodically renewed even while idle."""
+        if force or time.time() - self._last_rotate_at >= 1500:  # every ~25 min
+            self.rotate_cookies()
 
     def _params(self) -> dict[str, Any]:
         params: dict[str, Any] = {"hl": self.language, "_reqid": self._reqid, "rt": "c"}
@@ -281,6 +349,7 @@ class GeminiWebClient:
         on_frame: Optional[Callable[[Any], None]] = None,
     ) -> GenerationResult:
         """Send one prompt (optionally with attached files) and collect the streamed answer."""
+        self.ensure_fresh()
         self.init()
         start = time.time()
         result = GenerationResult()
@@ -529,6 +598,7 @@ class GeminiWebClient:
         self, rpcs: list[tuple[str, str]], source_path: str = "/app"
     ) -> list[Any]:
         """POST one or more RPCs to batchexecute; returns parsed frames."""
+        self.ensure_fresh()
         self.init()
         params = {
             **self._params(),

@@ -15,6 +15,8 @@
 - 👁️ **看图 / 看视频**（上传本地文件，Gemini 识别后返回描述）
 - 🎨 **生图**（Imagen）与 🎬 **生视频**（Veo），自动下载成品到本地
 - 💬 会话管理（列出 / 读取 / 删除历史对话）
+- 🔄 **`__Secure-1PSIDTS` 自动续期**：通过 `accounts.google.com/RotateCookies` 每 25 分钟
+  后台旋转短效令牌并持久化回 cookie 文件——只要服务常驻，令牌不再过期
 
 **核心特性**：不走官方 API —— 不需要 API Key、不产生 API 计费。它"反编译"本地浏览器
 （Chrome / Edge / Chromium）里已登录的 Google 会话 Cookie，原样重放 Gemini 网页端的
@@ -292,7 +294,8 @@ gemini_generate_video(prompt="一只橘猫在窗台上看雨，电影镜头，5�
 
 | 现象 | 原因 / 解决 |
 |---|---|
-| `SNlM0e` 解析失败 / HTTP 400 | Cookie 过期（`__Secure-1PSIDTS` 短效）：浏览器重新登录并重新导出 |
+| `SNlM0e` 解析失败 / HTTP 400 | **先看能否自愈**：服务会自动尝试 RotateCookies 续期并重试；若返回 401 说明整个会话已失效，需重新导出一次 cookie。**之后只要服务常驻（DSH 挂着），每 25 分钟自动换新，不会再过期** |
+| 提示 `RotateCookies 401` | 会话彻底失效（超过续期窗口）：浏览器重新登录 gemini.google.com，重新导出 cookie，并触发一次服务重载 |
 | 提示 `portal/app-bound cookie encryption` | 新版浏览器无法离线解密：用 Cookie-Editor 导出 + `--cookie-file` |
 | 找不到 Cookie 数据库 | 未在该浏览器登录 Google，或浏览器未关闭 |
 | 错误码 `1037` | 用量/频率超限，稍等再试 |
