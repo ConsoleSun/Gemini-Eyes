@@ -1,0 +1,173 @@
+# gemini-web-mcp
+
+一个 **MCP（Model Context Protocol）服务**，让任何 Agent（Claude、Cline、各类 MCP 客户端）直接和 **Gemini 网页端**（gemini.google.com）对话。
+
+- ✅ **不走官方 API**：不需要 API Key、不产生 API 计费
+- ✅ **"反编译 cookie" 鉴权**：自动提取并解密本地 Chrome / Edge / Chromium 浏览器里已登录的 Google 会话 Cookie（Windows DPAPI / macOS 钥匙串 / Linux "peanuts" 密钥），原样重放浏览器请求
+- ✅ 完全模拟网页端行为：`StreamGenerate` 流式接口 + `batchexecute` RPC（列会话 / 读历史 / 删会话）
+- ✅ 与网页端共享历史：新开的对话会出现在 gemini.google.com 的侧边栏里
+
+> ⚠️ 注意：本项目属于对 Gemini 网页端内部接口的逆向封装，非官方 API。仅用于个人学习与自动化。**请勿滥用**，行为受 Google 服务条款约束，账号风险自负。
+
+---
+
+## 工作原理
+
+```
+┌────────────┐   MCP(stdin/HTTP)   ┌─────────────────┐
+│  Agent     │ ◄──────────────────► │  gemini-web-mcp  │
+└────────────┘                     └────────┬────────┘
+                                            │ requests（带上解密的 Cookie）
+                                            ▼
+                                 ┌──────────────────────────┐
+                                 │ gemini.google.com 网页端   │
+                                 │  StreamGenerate /         │
+                                 │  batchexecute（内网 RPC）  │
+                                 └──────────────────────────┘
+```
+
+1. **反编译 Cookie**（`gemini_mcp/cookie_extractor.py`）
+   - 从浏览器配置目录找到 Cookie 数据库（SQLite）和 `Local State` 加密密钥文件
+   - 按平台解密：
+     - **Windows**：`DPAPI`（`CryptUnprotectData`）解出 AES-256-GCM 主密钥
+     - **macOS**：`security` 命令读钥匙串 "Chrome Safe Storage"，PBKDF2 派生 AES-128 密钥
+     - **Linux**：Chromium 硬编码口令 `"peanuts"` 解出 AES-256-GCM 主密钥
+   - 逐条解密 `v10` 前缀的 AES-GCM Cookie；旧版明文/base64 直接读
+   - 先把数据库复制到临时文件再读，避免浏览器运行时的 SQLite 锁
+2. **换令牌**（`gemini_mcp/gemini_client.py`）
+   - 访问 `https://gemini.google.com/app`，从页面提取 `SNlM0e`（CSRF 令牌）、`cfb2h`（build label）、`FdrFJe`（session id）
+3. **对话**：POST `/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate`，流式解析长度前缀分帧响应，累积文本、思考内容、会话/回复/候选 ID
+
+---
+
+## 安装
+
+需要 Python ≥ 3.10（推荐用 [uv](https://docs.astral.sh/uv/)）：
+
+```bash
+cd gemini-web-mcp
+uv sync --extra dev     # 安装依赖（mcp / requests / pycryptodome）
+```
+
+## 使用前的准备（一次性）
+
+1. 在 **Chrome / Edge / Chromium** 里登录 `https://gemini.google.com`（能看到 Gemini 界面即可）
+2. **关闭浏览器**（否则 Cookie 数据库被锁，虽然程序会自动复制一份，但保险起见先关）
+3. 可选：指定非默认配置目录
+   - Linux: `~/.config/google-chrome`（Edge: `~/.config/microsoft-edge`）
+   - Windows: `%LOCALAPPDATA%\Google\Chrome\User Data`
+   - macOS: `~/Library/Application Support/Google/Chrome`
+
+先用调试 CLI 验证 Cookie 能被正确"反编译"：
+
+```bash
+# 列出找到的 google.com cookie 名（值已打码）
+uv run python -m gemini_mcp.cookie_extractor --browser chrome --list --domain google.com
+
+# 查看解密后的完整值（敏感！仅调试用）
+uv run python -m gemini_mcp.cookie_extractor --browser chrome --reveal --domain google.com
+```
+
+## 启动 MCP 服务
+
+```bash
+# 标准输出传输（大多数 MCP 客户端用这个）
+uv run gemini-mcp --browser chrome
+
+# Edge / 指定配置文件
+uv run gemini-mcp --browser edge --profile "Profile 1"
+
+# HTTP 传输（SSE/streamable-http，供远程 Agent 或调试）
+uv run gemini-mcp --transport http --port 8900
+
+# 手动导出的 cookie JSON（[{name,value,...}] 或 {name:value}）
+uv run gemini-mcp --cookie-file cookies.json
+```
+
+也可以设置环境变量 `GEMINI_COOKIE_FILE=/path/to/cookies.json` 代替 `--cookie-file`。
+
+### Claude Desktop 配置示例
+
+`claude_desktop_config.json`：
+
+```json
+{
+  "mcpServers": {
+    "gemini-web": {
+      "command": "/home/you/.local/bin/uv",
+      "args": ["run", "--directory", "/home/you/Gemini Eyes/gemini-web-mcp", "gemini-mcp", "--browser", "chrome"]
+    }
+  }
+}
+```
+
+### Cline / Roo Code / 其他支持 MCP 的 IDE
+
+同样的 `command` + `args`，或 stdio 方式接入；HTTP 模式则填 `http://127.0.0.1:8900/mcp`。
+
+---
+
+## 工具清单
+
+| 工具 | 说明 |
+|---|---|
+| `gemini_send_message(message, conversation_id?, response_id?, language?)` | 发消息；带 `conversation_id` 则继续已有对话。返回 `text` + `conversation_id/response_id/candidate_id`（用于后续续聊） |
+| `gemini_list_conversations(limit=13)` | 列出账号最近的对话（含置顶标记和时间戳） |
+| `gemini_read_conversation(conversation_id, limit=10)` | 读取某对话的完整轮次（新→旧） |
+| `gemini_delete_conversation(conversation_id)` | 删除对话（不可恢复） |
+| `gemini_status()` | 诊断：Cookie 数量、关键 Cookie 是否齐全、令牌能否换到 |
+
+多轮对话示例（Agent 视角）：
+
+```
+1. gemini_send_message("帮我写一个快速排序") 
+   → {text: "...", conversation_id: "c_abc", response_id: "r_1", ...}
+2. gemini_send_message("改用 C++ 实现", conversation_id: "c_abc", response_id: "r_1")
+   → 同一对话内的下一轮
+```
+
+---
+
+## 开发
+
+```bash
+uv run pytest          # 跑单元测试（合成加密数据，无需真实浏览器）
+uv run python -m gemini_mcp.cookie_extractor --help
+```
+
+测试覆盖：AES-GCM v10 解密、Linux "peanuts" Local State、分帧流解析（含 UTF-16 长度）、
+StreamGenerate 请求构造、batchexecute 会话 RPC。
+
+### 常见问题
+
+| 现象 | 原因 / 解决 |
+|---|---|
+| `SNlM0e` 解析失败 / HTTP 400 | Cookie 过期：浏览器重新登录 gemini.google.com，重启服务 |
+| 找不到 Cookie 数据库 | 未在该浏览器登录 Google，或浏览器正开着导致复制失败 |
+| 提示 `portal/app-bound cookie encryption` | 2025 年后的新版 Chrome/Edge 改用系统 portal 加密，**无法离线解密**。用浏览器扩展（如 Cookie-Editor、EditThisCookie）把 `gemini.google.com` 的 cookie 导出为 JSON，然后 `uv run gemini-mcp --cookie-file cookies.json`（或设环境变量 `GEMINI_COOKIE_FILE`） |
+| 1037 错误码 | 用量/频率超限，稍等再试 |
+| 1060 错误码 | IP 被 Google 临时限制，换网络或等一会 |
+| 新对话不在网页端出现 | 网页端需要刷新；本服务与网页端共享同一账号历史 |
+
+### 手动导出 Cookie（新版浏览器必读）
+
+新版 Chrome/Edge 的 cookie 加密无法自动解密时：
+
+1. 浏览器打开 `https://gemini.google.com` 并保持登录
+2. 用扩展 **Cookie-Editor**（或同类工具）导出全部 cookie 为 JSON
+3. 保存为 `cookies.json`，格式二选一：
+
+```json
+[
+  {"name": "__Secure-1PSID", "value": "xxxx", "domain": ".google.com", "path": "/"},
+  {"name": "SID", "value": "xxxx", "domain": ".google.com", "path": "/"}
+]
+```
+
+或简化为 `{"__Secure-1PSID": "xxxx", "SID": "xxxx"}`。
+
+4. 启动：`uv run gemini-mcp --cookie-file cookies.json`
+
+## 免责声明
+
+本项目与 Google 无任何关联。Cookie 仅保存在本机内存中，不会上传；但请妥善保管解密后的 Cookie 值（`--reveal` 输出），泄露等于账号泄露。

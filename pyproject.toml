@@ -1,0 +1,30 @@
+[project]
+name = "gemini-web-mcp"
+version = "0.1.0"
+description = "MCP server that lets agents talk to gemini.google.com through the web interface (cookie-based auth, no API key)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.2.0",
+    "requests>=2.31.0",
+    "pycryptodome>=3.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+gemini-mcp = "gemini_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gemini_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
