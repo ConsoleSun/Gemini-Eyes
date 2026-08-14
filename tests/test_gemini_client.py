@@ -344,8 +344,8 @@ def test_init_requires_snlm0e():
 # Media: upload, generate-with-files, media parsing, download
 # ---------------------------------------------------------------------------
 
-def test_upload_file_posts_to_content_push(monkeypatch, tmp_path):
-    captured = {}
+def test_upload_file_two_phase_resumable(monkeypatch, tmp_path):
+    captured = []
     img = tmp_path / "photo.png"
     img.write_bytes(b"\x89PNG\r\n\x1a\nfakepngdata")
 
@@ -357,23 +357,34 @@ def test_upload_file_posts_to_content_push(monkeypatch, tmp_path):
         def get(self, url, **kw):
             return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"t"}'})()
 
-        def post(self, url, files=None, headers=None, **kw):
-            captured["url"] = url
-            captured["headers"] = headers
-            captured["files"] = files
-            return type("R", (), {"status_code": 200, "text": "/contrib_service/ttl_1d/12345"})
+        def post(self, url, headers=None, data=None, **kw):
+            captured.append((url, headers, data))
+            if url == "https://push.clients6.google.com/upload":
+                return type("R", (), {
+                    "status_code": 200,
+                    "headers": {"x-goog-upload-url": "https://upload.example/up"},
+                    "text": "",
+                })()
+            return type("R", (), {"status_code": 200, "text": "/contrib_service/ttl_1d/12345"})()
 
     import gemini_mcp.gemini_client as gc
     monkeypatch.setattr(gc.requests, "Session", FakeSession)
     client = GeminiWebClient({})
-    ident = client.upload_file(str(img))
-    assert ident == "/contrib_service/ttl_1d/12345"
-    assert captured["url"] == "https://content-push.googleapis.com/upload"
-    assert captured["headers"]["Push-ID"] == "feeds/mcudyrk2a4khkz"
-    assert captured["headers"]["X-Tenant-Id"] == "bard-storage"
-    filepart = captured["files"]["file"]
-    assert filepart[0] == "photo.png"
-    assert filepart[1] == b"\x89PNG\r\n\x1a\nfakepngdata"
+    entry = client.upload_file(str(img))
+    assert len(captured) == 2
+    url1, h1, d1 = captured[0]
+    assert url1 == "https://push.clients6.google.com/upload"
+    assert h1["x-goog-upload-command"] == "start"
+    assert h1["x-goog-upload-header-content-length"] == "19"
+    assert h1["push-id"] == "feeds/mcudyrk2a4khkz"
+    assert d1 == b"File name: photo.png"
+    url2, h2, d2 = captured[1]
+    assert url2 == "https://upload.example/up"
+    assert h2["x-goog-upload-command"] == "upload, finalize"
+    assert h2["x-goog-upload-offset"] == "0"
+    assert d2 == b"\x89PNG\r\n\x1a\nfakepngdata"
+    # file entry: [[identifier, type_int, None, mime], filename]
+    assert entry == [["/contrib_service/ttl_1d/12345", 1, None, "image/png"], "photo.png"]
 
 
 def test_upload_file_missing_path_raises():
@@ -396,7 +407,13 @@ def test_generate_with_files_embeds_file_data(monkeypatch, tmp_path):
             return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"tok"}'})()
 
         def post(self, url, params=None, data=None, stream=None, timeout=None, **kw):
-            if "upload" in url:
+            if "clients6.google.com/upload" in url:
+                return type("R", (), {
+                    "status_code": 200,
+                    "headers": {"x-goog-upload-url": "https://upload.example/up"},
+                    "text": "",
+                })()
+            if url == "https://upload.example/up":
                 return type("R", (), {"status_code": 200, "text": "/contrib_service/x"})()
 
             captured["data"] = data
@@ -409,7 +426,7 @@ def test_generate_with_files_embeds_file_data(monkeypatch, tmp_path):
     res = client.generate("what is this?", files=[str(img)])
     assert res.text == "I see an image."
     inner = json.loads(json.loads(captured["data"]["f.req"])[1])
-    assert inner[0][3] == [[["/contrib_service/x"], "pic.png"]]
+    assert inner[0][3] == [[["/contrib_service/x", 1, None, "image/png"], "pic.png"]]
 
 
 def test_consume_media_generated_image_and_video():

@@ -32,8 +32,22 @@ GENERATE_URL = (
     f"{BASE_URL}/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
 )
 BATCH_EXEC_URL = f"{BASE_URL}/_/BardChatUi/data/batchexecute"
-UPLOAD_URL = "https://content-push.googleapis.com/upload"
+UPLOAD_URL = "https://push.clients6.google.com/upload"
 PUSH_ID = "feeds/mcudyrk2a4khkz"
+
+# File-type integer used inside the StreamGenerate file entry (web app enum).
+FILES_ENUM_INT = {
+    "application/octet-stream": 0,
+    "image": 1,
+    "video": 2,
+    "text": 3,
+    "audio": 4,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": 7,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": 10,
+    "application/pdf": 11,
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": 12,
+    "application/json": 16,
+}
 
 # Default 10-slot metadata used for brand-new conversations (mirrors the web app).
 DEFAULT_METADATA: list[Any] = ["", "", "", None, None, None, None, None, None, ""]
@@ -273,9 +287,7 @@ class GeminiWebClient:
 
         file_data = None
         if files:
-            file_data = [
-                [[self.upload_file(path)], Path(path).name] for path in files
-            ]
+            file_data = [self.upload_file(path) for path in files]
 
         inner: list[Any] = [None] * 69
         inner[0] = [prompt, 0, None, file_data, None, None, 0]
@@ -401,36 +413,73 @@ class GeminiWebClient:
                     MediaRef(kind="generated_video", url=urls[1], title=urls[0] or "")
                 )
 
-    def upload_file(self, path: str, filename: Optional[str] = None) -> str:
-        """Upload a local file to Google's server; returns the file identifier.
+    def upload_file(self, path: str, filename: Optional[str] = None) -> list[Any]:
+        """Upload a local file with the two-phase resumable protocol.
 
-        The identifier (e.g. ``/contrib_service/ttl_1d/...``) is used as the
-        file reference inside StreamGenerate requests.
+        Phase 1 asks the upload server for a resumable URL, phase 2 streams
+        the bytes. Returns the StreamGenerate file entry::
+
+            [[identifier, file_type_int, None, mime_type], filename]
         """
         file_path = Path(path)
         if not file_path.is_file():
             raise GeminiWebError(f"File not found: {path}")
         content = file_path.read_bytes()
         name = filename or file_path.name
-        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        file_code = FILES_ENUM_INT.get(
+            mime if mime.startswith("application") else mime.split("/")[0], 0
+        )
 
-        files = {"file": (name, content, content_type)}
-        headers = {
+        common = {
             "Origin": BASE_URL,
             "Referer": f"{BASE_URL}/",
             "X-Tenant-Id": "bard-storage",
-            "Push-ID": PUSH_ID,
+            "push-id": PUSH_ID,
+            "x-goog-upload-protocol": "resumable",
         }
-        resp = self.session.post(UPLOAD_URL, files=files, headers=headers, timeout=self.timeout)
+
+        # Phase 1: start the resumable upload, get the upload URL.
+        start_headers = {
+            **common,
+            "x-goog-upload-command": "start",
+            "x-goog-upload-header-content-length": str(len(content)),
+        }
+        resp = self.session.post(
+            UPLOAD_URL,
+            headers=start_headers,
+            data=f"File name: {name}".encode(),
+            timeout=self.timeout,
+        )
         if resp.status_code != 200:
             raise GeminiWebError(
-                f"File upload failed: HTTP {resp.status_code} — {resp.text[:200]}",
+                f"Upload start failed: HTTP {resp.status_code} — {resp.text[:200]}",
+                code=resp.status_code,
+            )
+        upload_url = resp.headers.get("x-goog-upload-url")
+        if not upload_url:
+            raise GeminiWebError(
+                f"Upload start returned no x-goog-upload-url: {resp.text[:200]}"
+            )
+
+        # Phase 2: upload, finalize.
+        upload_headers = {
+            **common,
+            "x-goog-upload-command": "upload, finalize",
+            "x-goog-upload-offset": "0",
+        }
+        resp = self.session.post(
+            upload_url, headers=upload_headers, data=content, timeout=self.timeout
+        )
+        if resp.status_code != 200:
+            raise GeminiWebError(
+                f"Upload finalize failed: HTTP {resp.status_code} — {resp.text[:200]}",
                 code=resp.status_code,
             )
         identifier = resp.text.strip()
         if not identifier.startswith("/"):
             raise GeminiWebError(f"Unexpected upload response: {identifier[:200]}")
-        return identifier
+        return [[identifier, file_code, None, mime], name]
 
     def download_media(self, url: str, save_path: str) -> str:
         """Download a media URL (googleusercontent.com) with the session cookies."""
