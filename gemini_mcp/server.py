@@ -103,6 +103,28 @@ mcp = MCPServer(
 # Tools
 # ---------------------------------------------------------------------------
 
+# Required session cookies (full list Google may expect; only __Secure-1PSID
+# is mandatory, __Secure-1PSIDTS is mandatory if present in your browser).
+REQUIRED_COOKIES = [
+    "__Secure-1PSID",
+    "__Secure-1PSIDTS",
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "__Secure-1PAPISID",
+    "__Secure-3PSID",
+    "__Secure-3PSIDTS",
+    "__Secure-3PAPISID",
+    "NID",
+    "AEC",
+    "SIDCC",
+    "__Secure-1PSIDCC",
+    "1P_JAR",
+]
+
+
 @mcp.tool()
 def gemini_status() -> dict[str, Any]:
     """Diagnose the connection to gemini.google.com: cookie availability, token freshness and reachability."""
@@ -110,18 +132,27 @@ def gemini_status() -> dict[str, Any]:
 
     cookies, errors = _load_cookies()
     names = sorted(cookies)
-    key_names = [n for n in ("__Secure-1PSID", "__Secure-1PSIDTS", "SID", "HSID") if n in cookies]
+    key_names = [n for n in REQUIRED_COOKIES if n in cookies]
+    missing = [n for n in REQUIRED_COOKIES if n not in cookies]
     status: dict[str, Any] = {
         "ok": False,
         "browser": _browser,
         "profile": _profile,
         "platform": platform.system(),
         "cookie_count": len(cookies),
-        "key_cookies_present": key_names,
+        "cookies_present": key_names,
+        "cookies_missing": missing,
         "errors": errors,
     }
     if not cookies:
         status["errors"] = errors or ["no cookies available"]
+        return status
+    if "__Secure-1PSID" not in cookies:
+        status["errors"] = [
+            "The mandatory '__Secure-1PSID' session cookie is missing. "
+            "Log in to gemini.google.com and export the cookies (Cookie-Editor "
+            "extension), then pass them via --cookie-file."
+        ]
         return status
     try:
         client = _get_client()

@@ -168,6 +168,16 @@ StreamGenerate 请求构造、batchexecute 会话 RPC。
 
 4. 启动：`uv run gemini-mcp --cookie-file cookies.json`
 
+**需要哪些 cookie？**
+
+- **必带**：`__Secure-1PSID`（账号主会话）；若浏览器里有 `__Secure-1PSIDTS` 则必须一起带（缺它会 401）
+- **推荐全带**：`SID`、`HSID`、`SSID`、`APISID`、`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PSID`、`__Secure-3PSIDTS`、`__Secure-3PAPISID`、`NID`、`AEC`、`SIDCC`、`__Secure-1PSIDCC`、`1P_JAR`
+- 最简单的做法：**全部导出，一个不落**（20~40 个都没关系）
+
+启动后用 `gemini_status` 工具自查：它会列出已有哪些、缺哪些关键 cookie。
+
+> ⚠️ `__Secure-1PSIDTS` 过期很快（几小时~几天），失效后重新导出即可。
+
 ## 免责声明
 
 本项目与 Google 无任何关联。Cookie 仅保存在本机内存中，不会上传；但请妥善保管解密后的 Cookie 值（`--reveal` 输出），泄露等于账号泄露。
