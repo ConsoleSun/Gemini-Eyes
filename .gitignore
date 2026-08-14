@@ -4,8 +4,7 @@ __pycache__/
 .venv/
 venv/
 
-# uv
-uv.lock
+# Build
 *.egg-info/
 dist/
 build/
