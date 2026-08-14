@@ -483,26 +483,43 @@ class GeminiWebClient:
             raise GeminiWebError(f"Unexpected upload response: {identifier[:200]}")
         return [[identifier, file_code, None, mime], name]
 
-    def download_media(self, url: str, save_path: str) -> str:
-        """Download a media URL (googleusercontent.com) with the session cookies."""
+    def download_media(
+        self, url: str, save_path: str, retries: int = 20, retry_delay: float = 10.0
+    ) -> str:
+        """Download a media URL with the session cookies.
+
+        Generated videos may still be rendering when the URL first appears:
+        the server then answers 206/404, and we retry until the content is
+        ready (mirrors the web app's polling behavior).
+        """
         dest = Path(save_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         headers = {"Referer": f"{BASE_URL}/"}
-        with self.session.get(url, headers=headers, stream=True, timeout=self.timeout) as resp:
-            if resp.status_code != 200:
-                raise GeminiWebError(
-                    f"Media download failed: HTTP {resp.status_code} for {url[:120]}",
-                    code=resp.status_code,
-                )
-            if not dest.suffix:
-                ctype = (resp.headers.get("content-type") or "").split(";")[0].lower()
-                ext = mimetypes.guess_extension(ctype) or ".bin"
-                dest = dest.with_suffix(ext)
-            with open(dest, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if chunk:
-                        fh.write(chunk)
-        return str(dest)
+        last_error: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                with self.session.get(
+                    url, headers=headers, stream=True, timeout=self.timeout
+                ) as resp:
+                    if resp.status_code == 200:
+                        if not dest.suffix:
+                            ctype = (resp.headers.get("content-type") or "").split(";")[0].lower()
+                            ext = mimetypes.guess_extension(ctype) or ".bin"
+                            dest = dest.with_suffix(ext)
+                        with open(dest, "wb") as fh:
+                            for chunk in resp.iter_content(chunk_size=65536):
+                                if chunk:
+                                    fh.write(chunk)
+                        return str(dest)
+                    last_error = GeminiWebError(
+                        f"Media download failed: HTTP {resp.status_code} for {url[:120]}",
+                        code=resp.status_code,
+                    )
+            except Exception as e:  # noqa: BLE001 - transient network errors
+                last_error = e
+            if attempt < retries:
+                time.sleep(retry_delay)
+        raise last_error or GeminiWebError(f"Media download failed for {url[:120]}")
 
     # ------------------------------------------------------------------
     # batchexecute RPCs

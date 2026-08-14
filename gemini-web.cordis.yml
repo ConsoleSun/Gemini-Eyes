@@ -21,7 +21,5 @@
           - --directory
           - /home/ubuntuhong/Gemini Eyes/gemini-web-mcp
           - gemini-mcp
-          - --browser
-          - chrome
-        env:
-          GEMINI_COOKIE_FILE: /tmp/gemini_cookies.json
+          - --cookie-file
+          - /tmp/gemini_cookies.json
