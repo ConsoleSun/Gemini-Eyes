@@ -64,6 +64,11 @@
      `[12][1]`（引用图）解析，并支持渲染期的 206 重试下载
    - 会话管理：POST `/_/BardChatUi/data/batchexecute`（列/读/删对话 RPC）
 
+4. **令牌自动续期**：`__Secure-1PSIDTS` 是 Google 的短效令牌（几小时~几天），服务通过
+   POST `https://accounts.google.com/RotateCookies` 每 25 分钟用当前会话换一组新 cookie
+   （含新 1PSIDTS），并**持久化回 cookie 文件**——只要服务常驻，令牌永不过期；
+   换令牌失败（SNlM0e 解析失败）时也会先旋转再重试，实现自愈。
+
 ---
 
 ## 目录结构
@@ -78,7 +83,7 @@ gemini-web-mcp/
 │   ├── server.py               # MCP 服务器（9 个工具）
 │   ├── cookie_extractor.py     # ★ cookie 反编译（DPAPI/Keychain/peanuts）
 │   └── gemini_client.py        # 网页端 RPC 客户端（令牌/对话/上传/媒体）
-└── tests/                      # 32 个单元测试（合成加密数据，无需真实浏览器）
+└── tests/                      # 38 个单元测试（合成加密数据，无需真实浏览器）
 ```
 
 ---
@@ -133,6 +138,10 @@ cookie 全量导出为 JSON：
 
 > 最省事的做法：**全部导出，一个不落**。`__Secure-1PSIDTS` 是短效令牌（几小时~几天），
 > 失效后重新导出即可。
+
+> 💡 **关于 `__Secure-1PSIDTS` 过期**：服务内置自动续期（每 25 分钟通过
+> `RotateCookies` 换新并写回 cookie 文件）。**只要服务常驻，不会再过期**；若服务停机
+> 超过令牌寿命导致失效，重新导出一次即可，之后恢复自动续期。
 
 ### 第 2 步：启动服务
 
@@ -310,7 +319,7 @@ gemini_generate_video(prompt="一只橘猫在窗台上看雨，电影镜头，5�
 ## 开发与测试
 
 ```bash
-uv run pytest                 # 32 个测试：AES-GCM 解密、两阶段上传、分帧解析（含 UTF-16）、
+uv run pytest                 # 38 个测试：AES-GCM 解密、两阶段上传、分帧解析（含 UTF-16）、
                               # StreamGenerate 请求构造、batchexecute RPC、媒体解析、下载
 uv run python -m gemini_mcp.cookie_extractor --help
 ```
