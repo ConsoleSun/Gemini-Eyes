@@ -120,7 +120,11 @@ class FrameParser:
             if not m:
                 break
             length = int(m.group(1))
-            start = pos + m.end()
+            # Google's length marker counts UTF-16 units from the newline
+            # after the digits THROUGH the newline after the JSON payload
+            # (i.e. marker = 1 + len(json) + 1). So start counting at the
+            # newline itself, not after it.
+            start = pos + m.start() + len(m.group(1))
             # Count UTF-16 units of the remaining buffer to know if the frame
             # payload has fully arrived.
             units = sum(2 if ord(ch) > 0xFFFF else 1 for ch in self._buf[start:])

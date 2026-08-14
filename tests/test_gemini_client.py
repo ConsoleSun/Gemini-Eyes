@@ -36,7 +36,9 @@ def test_get_nested_paths():
 
 def _frame(payload) -> str:
     s = json.dumps(payload, ensure_ascii=False)
-    return f"{len(s)}\n{s}\n"
+    # Google's length marker includes the newline after the digits and the
+    # newline after the JSON payload: marker = 1 + len(json) + 1.
+    return f"{len(s) + 2}\n\n{s}\n"
 
 
 def test_frame_parser_single_and_multiple():
@@ -60,7 +62,7 @@ def test_frame_parser_utf16_length():
     payload = [["wrb.fr", None, "你好👋", None]]
     s = json.dumps(payload, ensure_ascii=False)
     units = sum(2 if ord(ch) > 0xFFFF else 1 for ch in s)
-    raw = f"{units}\n{s}\n"
+    raw = f"{units + 2}\n\n{s}\n"  # marker includes both newlines
     p = FrameParser()
     p.feed(raw)
     assert len(p.frames) == 1
@@ -137,7 +139,7 @@ class FakeResponse:
 
     def iter_content(self, chunk_size=0, decode_unicode=False):
         raw = ")]}'\n\n" + "".join(
-            f"{len(json.dumps([f]))}\n{json.dumps([f])}\n" for f in self._frames
+            f"{len(json.dumps([f])) + 2}\n\n{json.dumps([f])}\n" for f in self._frames
         )
         for i in range(0, len(raw), 64):
             yield raw[i : i + 64]
@@ -259,7 +261,7 @@ def test_generate_non_200_raises(monkeypatch):
 
 def _batch_response(frames):
     return ")]}'\n\n" + "".join(
-        f"{len(json.dumps([f]))}\n{json.dumps([f])}\n" for f in frames
+        f"{len(json.dumps([f])) + 2}\n\n{json.dumps([f])}\n" for f in frames
     )
 
 
