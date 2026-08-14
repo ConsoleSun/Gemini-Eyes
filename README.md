@@ -109,12 +109,33 @@ uv run gemini-mcp --cookie-file cookies.json
 
 ## 工具清单
 
+### 对话
+
 | 工具 | 说明 |
 |---|---|
-| `gemini_send_message(message, conversation_id?, response_id?, language?)` | 发消息；带 `conversation_id` 则继续已有对话。返回 `text` + `conversation_id/response_id/candidate_id`（用于后续续聊） |
+| `gemini_send_message(message, conversation_id?, response_id?, language?, file_paths?)` | 发消息（可附图片/视频文件）；带 `conversation_id` 则继续已有对话 |
 | `gemini_list_conversations(limit=13)` | 列出账号最近的对话（含置顶标记和时间戳） |
-| `gemini_read_conversation(conversation_id, limit=10)` | 读取某对话的完整轮次（新→旧） |
+| `gemini_read_conversation(conversation_id, limit=10)` | 读取某对话的完整轮次（新→旧，含引用的媒体） |
 | `gemini_delete_conversation(conversation_id)` | 删除对话（不可恢复） |
+
+### 视觉（Gemini 当"眼睛"）
+
+| 工具 | 说明 |
+|---|---|
+| `gemini_analyze_media(file_path, prompt?)` | 上传一张图片/视频让 Gemini 识别，返回描述文本。**Agent 收到用户上传的图片/视频时应优先调用它** |
+| `gemini_download_media(url, save_path)` | 用登录会话下载媒体 URL 到本地（某些 googleusercontent 链接需要 cookie） |
+
+### 生成（Gemini 当"手"）
+
+| 工具 | 说明 |
+|---|---|
+| `gemini_generate_image(prompt, reference_image?, save_dir?)` | 文生图（Imagen）；传 `reference_image` 可图生图。自动把生成图下载到本地并返回路径 |
+| `gemini_generate_video(prompt, save_dir?, timeout_seconds?)` | 文生视频（Veo）。生成是异步的，工具会轮询直到渲染完成，下载到本地并返回路径 |
+
+### 其他
+
+| 工具 | 说明 |
+|---|---|
 | `gemini_status()` | 诊断：Cookie 数量、关键 Cookie 是否齐全、令牌能否换到 |
 
 多轮对话示例（Agent 视角）：
@@ -125,6 +146,34 @@ uv run gemini-mcp --cookie-file cookies.json
 2. gemini_send_message("改用 C++ 实现", conversation_id: "c_abc", response_id: "r_1")
    → 同一对话内的下一轮
 ```
+
+"眼睛 + 手"工作流示例（DSH 中）：
+
+```
+用户上传 photo.jpg
+→ gemini_analyze_media(file_path="/.../photo.jpg", prompt="描述这张图片")
+→ 把 Gemini 的描述转述给用户
+
+用户说"画一只赛博朋克风的猫"
+→ gemini_generate_image(prompt="赛博朋克风的猫")
+→ 返回 {local_path: "./media/generated_image_xxx.png"}，把本地路径展示给用户
+```
+
+---
+
+## 接入 DSH（DeepSeek Harness）
+
+DSH 原生支持 MCP 客户端插件（`@deepseek-ai/dsh-mcp-client`）。项目里已附 `gemini-web.cordis.yml` 示例：
+
+```sh
+dsh web --patch "/home/ubuntuhong/Gemini Eyes/gemini-web-mcp/gemini-web.cordis.yml"
+```
+
+按需修改该文件里的 `command`、`args`、`env.GEMINI_COOKIE_FILE` 路径。启动后工具会以
+`mcp__gemini-web__gemini_analyze_media` 等形式暴露给 Agent。
+
+> 注意：DSH 的 stdio 桥接器会主动移除名称疑似凭据的环境变量；cookie 通过
+> `GEMINI_COOKIE_FILE`（指向磁盘文件）传递不受影响。
 
 ---
 

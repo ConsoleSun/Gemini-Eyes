@@ -15,11 +15,13 @@ browser profile (see cookie_extractor.py).
 from __future__ import annotations
 
 import json
+import mimetypes
 import random
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 import requests
@@ -30,6 +32,8 @@ GENERATE_URL = (
     f"{BASE_URL}/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
 )
 BATCH_EXEC_URL = f"{BASE_URL}/_/BardChatUi/data/batchexecute"
+UPLOAD_URL = "https://content-push.googleapis.com/upload"
+PUSH_ID = "feeds/mcudyrk2a4khkz"
 
 # Default 10-slot metadata used for brand-new conversations (mirrors the web app).
 DEFAULT_METADATA: list[Any] = ["", "", "", None, None, None, None, None, None, ""]
@@ -70,6 +74,19 @@ class GeminiWebError(RuntimeError):
 
 
 @dataclass
+class MediaRef:
+    """A media item referenced or produced by Gemini."""
+
+    kind: str  # "web_image" | "generated_image" | "generated_video"
+    url: str = ""
+    title: str = ""
+    alt: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "url": self.url, "title": self.title, "alt": self.alt}
+
+
+@dataclass
 class GenerationResult:
     text: str = ""
     thoughts: str = ""
@@ -78,6 +95,7 @@ class GenerationResult:
     candidate_id: str = ""
     completed: bool = False
     metadata: list[Any] = field(default_factory=list)
+    media: list[MediaRef] = field(default_factory=list)
     raw_frames: list[Any] = field(default_factory=list)
     elapsed: float = 0.0
 
@@ -89,6 +107,7 @@ class GenerationResult:
             "response_id": self.response_id,
             "candidate_id": self.candidate_id,
             "completed": self.completed,
+            "media": [m.to_dict() for m in self.media],
             "elapsed_seconds": round(self.elapsed, 2),
         }
 
@@ -244,15 +263,22 @@ class GeminiWebClient:
         self,
         prompt: str,
         metadata: Optional[list[Any]] = None,
+        files: Optional[list[str]] = None,
         on_frame: Optional[Callable[[Any], None]] = None,
     ) -> GenerationResult:
-        """Send one prompt and collect the streamed answer."""
+        """Send one prompt (optionally with attached files) and collect the streamed answer."""
         self.init()
         start = time.time()
         result = GenerationResult()
 
+        file_data = None
+        if files:
+            file_data = [
+                [[self.upload_file(path)], Path(path).name] for path in files
+            ]
+
         inner: list[Any] = [None] * 69
-        inner[0] = [prompt, 0, None, None, None, None, 0]
+        inner[0] = [prompt, 0, None, file_data, None, None, 0]
         inner[1] = [self.language]
         inner[2] = metadata or DEFAULT_METADATA.copy()
         inner[6] = [1]
@@ -344,6 +370,88 @@ class GeminiWebClient:
                 result.thoughts = thoughts
             if get_nested(candidate, [8, 0]) == 2:
                 result.completed = True
+            self._consume_media(candidate, result)
+
+    # ------------------------------------------------------------------
+    # Media: upload, parse, download
+    # ------------------------------------------------------------------
+
+    def _consume_media(self, candidate: Any, result: GenerationResult) -> None:
+        """Extract web images, generated images and generated videos from a candidate."""
+        # Web images cited in the answer
+        for img in get_nested(candidate, [12, 1], []) or []:
+            url = get_nested(img, [0, 0, 0])
+            if url:
+                result.media.append(
+                    MediaRef(kind="web_image", url=url, alt=get_nested(img, [0, 4], "") or "")
+                )
+        # Generated images (plain generation + image-to-image)
+        for img in (get_nested(candidate, [12, 7, 0], []) or []) + (
+            get_nested(candidate, [12, 0, "8", 0], []) or []
+        ):
+            url = get_nested(img, [0, 3, 3])
+            if url:
+                result.media.append(MediaRef(kind="generated_image", url=url))
+        # Generated videos (Veo etc.)
+        video_info = get_nested(candidate, [12, 59, 0, 0, 0], [])
+        if video_info:
+            urls = get_nested(video_info, [0, 7], [])
+            if isinstance(urls, list) and len(urls) >= 2 and urls[1]:
+                result.media.append(
+                    MediaRef(kind="generated_video", url=urls[1], title=urls[0] or "")
+                )
+
+    def upload_file(self, path: str, filename: Optional[str] = None) -> str:
+        """Upload a local file to Google's server; returns the file identifier.
+
+        The identifier (e.g. ``/contrib_service/ttl_1d/...``) is used as the
+        file reference inside StreamGenerate requests.
+        """
+        file_path = Path(path)
+        if not file_path.is_file():
+            raise GeminiWebError(f"File not found: {path}")
+        content = file_path.read_bytes()
+        name = filename or file_path.name
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+        files = {"file": (name, content, content_type)}
+        headers = {
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/",
+            "X-Tenant-Id": "bard-storage",
+            "Push-ID": PUSH_ID,
+        }
+        resp = self.session.post(UPLOAD_URL, files=files, headers=headers, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise GeminiWebError(
+                f"File upload failed: HTTP {resp.status_code} — {resp.text[:200]}",
+                code=resp.status_code,
+            )
+        identifier = resp.text.strip()
+        if not identifier.startswith("/"):
+            raise GeminiWebError(f"Unexpected upload response: {identifier[:200]}")
+        return identifier
+
+    def download_media(self, url: str, save_path: str) -> str:
+        """Download a media URL (googleusercontent.com) with the session cookies."""
+        dest = Path(save_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        headers = {"Referer": f"{BASE_URL}/"}
+        with self.session.get(url, headers=headers, stream=True, timeout=self.timeout) as resp:
+            if resp.status_code != 200:
+                raise GeminiWebError(
+                    f"Media download failed: HTTP {resp.status_code} for {url[:120]}",
+                    code=resp.status_code,
+                )
+            if not dest.suffix:
+                ctype = (resp.headers.get("content-type") or "").split(";")[0].lower()
+                ext = mimetypes.guess_extension(ctype) or ".bin"
+                dest = dest.with_suffix(ext)
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        fh.write(chunk)
+        return str(dest)
 
     # ------------------------------------------------------------------
     # batchexecute RPCs
@@ -424,15 +532,18 @@ class GeminiWebClient:
                     text = get_nested(candidate, [1, 0], "")
                     status = get_nested(candidate, [8, 0])
                     if rcid and text:
-                        turns.append(
-                            {
-                                "role": "model",
-                                "text": str(text),
-                                "response_id": str(rid),
-                                "candidate_id": str(rcid),
-                                "status": status,
-                            }
-                        )
+                        entry: dict[str, Any] = {
+                            "role": "model",
+                            "text": str(text),
+                            "response_id": str(rid),
+                            "candidate_id": str(rcid),
+                            "status": status,
+                            "media": [],
+                        }
+                        media_probe = GenerationResult()
+                        self._consume_media(candidate, media_probe)
+                        entry["media"] = [m.to_dict() for m in media_probe.media]
+                        turns.append(entry)
         return {"conversation_id": conversation_id, "turns": turns}
 
     def delete_conversation(self, conversation_id: str) -> None:

@@ -26,13 +26,14 @@ import argparse
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.mcpserver.server import MCPServer
 
 from .cookie_extractor import cookies_for_gemini
-from .gemini_client import DEFAULT_METADATA, GeminiWebClient, GeminiWebError
+from .gemini_client import DEFAULT_METADATA, MediaRef, GeminiWebClient, GeminiWebError
 
 log = logging.getLogger("gemini_mcp")
 
@@ -172,8 +173,9 @@ def gemini_send_message(
     conversation_id: Optional[str] = None,
     response_id: Optional[str] = None,
     language: Optional[str] = None,
+    file_paths: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Send a message to Gemini (web interface).
+    """Send a message to Gemini (web interface), optionally attaching files.
 
     Without conversation_id a brand-new chat is started. Pass the
     conversation_id (and optionally response_id) from a previous result to
@@ -184,10 +186,12 @@ def gemini_send_message(
         conversation_id: Continue this conversation (from a previous call).
         response_id: The response id to reply under (from a previous call).
         language: UI/reply language hint, e.g. "zh-CN" (default), "en".
+        file_paths: Local paths of images/videos to attach (uploaded to
+            Gemini and analyzed together with the message).
 
     Returns:
         The model's answer plus conversation_id/response_id/candidate_id to
-        continue the chat later.
+        continue the chat later, and any web images cited in the reply.
     """
     if not message or not message.strip():
         raise ValueError("message must not be empty")
@@ -195,9 +199,167 @@ def gemini_send_message(
     if language and language != client.language:
         client.language = language
     meta = _metadata_for(conversation_id, response_id)
-    result = client.generate(message.strip(), metadata=meta)
+    result = client.generate(message.strip(), metadata=meta, files=file_paths)
     _remember(result)
     return result.to_dict()
+
+
+@mcp.tool()
+def gemini_analyze_media(
+    file_path: str,
+    prompt: str = "请详细描述这张图片/这个视频的内容，包括所有可见的细节。",
+    conversation_id: Optional[str] = None,
+    response_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Use Gemini's eyes: upload one image/video and get a description.
+
+    This is the tool an agent should call when the user uploads an image or
+    video — Gemini looks at it and the result text comes back here.
+
+    Args:
+        file_path: Local path of the image or video file.
+        prompt: What to ask about the media (default: detailed description).
+        conversation_id: Optional conversation to continue within.
+
+    Returns:
+        {text, media (cited web images), conversation_id, response_id}.
+    """
+    if not file_path:
+        raise ValueError("file_path must not be empty")
+    client = _get_client()
+    meta = _metadata_for(conversation_id, response_id)
+    result = client.generate(prompt, metadata=meta, files=[file_path])
+    _remember(result)
+    return result.to_dict()
+
+
+@mcp.tool()
+def gemini_generate_image(
+    prompt: str,
+    reference_image: Optional[str] = None,
+    save_dir: str = "./media",
+    conversation_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Ask Gemini to generate an image (Imagen) from a text prompt.
+
+    Optionally pass a reference_image (local path) for image-to-image edits.
+
+    Args:
+        prompt: What image to generate, e.g. "一只在月球上打伞的猫，水彩风格".
+        reference_image: Optional local image path to edit / use as reference.
+        save_dir: Directory the generated image is downloaded to.
+        conversation_id: Optional existing conversation to generate within.
+
+    Returns:
+        {text, generated images (local paths + URLs), conversation_id}.
+    """
+    if not prompt or not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    client = _get_client()
+    files = [reference_image] if reference_image else None
+    meta = _metadata_for(conversation_id, None)
+    result = client.generate(prompt.strip(), metadata=meta, files=files)
+    _remember(result)
+    return _with_saved_media(result, save_dir, kinds={"generated_image"})
+
+
+@mcp.tool()
+def gemini_generate_video(
+    prompt: str,
+    save_dir: str = "./media",
+    conversation_id: Optional[str] = None,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    """Ask Gemini to generate a video (Veo) from a text prompt.
+
+    Video generation is asynchronous: this tool sends the request, then polls
+    the conversation until Gemini finishes rendering and returns the video URL.
+
+    Args:
+        prompt: What video to generate, e.g. "一只橘猫在窗台上看下雨，电影感".
+        save_dir: Directory the generated video is downloaded to.
+        conversation_id: Optional existing conversation to generate within.
+        timeout_seconds: Max time to wait for rendering (default 600s).
+
+    Returns:
+        {text, generated video (local path + URL), conversation_id}.
+    """
+    if not prompt or not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    client = _get_client()
+    meta = _metadata_for(conversation_id, None)
+    result = client.generate(prompt.strip(), metadata=meta)
+    _remember(result)
+    videos = [m for m in result.media if m.kind == "generated_video"]
+
+    # Poll read_conversation while the video is still rendering.
+    cid = result.conversation_id
+    deadline = time.monotonic() + timeout_seconds
+    while not videos and cid and time.monotonic() < deadline:
+        time.sleep(15)
+        try:
+            history = client.read_conversation(cid, limit=3)
+            for turn in history.get("turns", []):
+                for item in turn.get("media", []) or []:
+                    if item["kind"] == "generated_video" and item.get("url"):
+                        videos.append(
+                            MediaRef(kind="generated_video", url=item["url"])
+                        )
+        except Exception:  # noqa: BLE001 - keep polling on transient errors
+            continue
+    if not videos:
+        return {**result.to_dict(), "generated_video": None,
+                "note": "Gemini did not return a video yet within the timeout. "
+                        "Check the conversation later with gemini_read_conversation."}
+    result.media = [m for m in result.media if m.kind != "generated_video"] + videos
+    return _with_saved_media(result, save_dir, kinds={"generated_video"})
+
+
+@mcp.tool()
+def gemini_download_media(
+    url: str,
+    save_path: str,
+) -> dict[str, str]:
+    """Download a media URL (googleusercontent.com) to a local file.
+
+    Some media URLs only work with the logged-in session cookies; this tool
+    downloads them through the authenticated session.
+
+    Args:
+        url: The media URL (e.g. from a generated image result).
+        save_path: Where to save the file (a .png/.mp4 suffix is added if missing).
+
+    Returns:
+        {path: local file path}
+    """
+    if not url or not save_path:
+        raise ValueError("url and save_path must not be empty")
+    path = _get_client().download_media(url, save_path)
+    return {"path": path}
+
+
+def _with_saved_media(
+    result: Any, save_dir: str, kinds: set[str]
+) -> dict[str, Any]:
+    """Download generated media into save_dir and return result dict with local paths."""
+    import os
+
+    out = result.to_dict()
+    saved = []
+    for i, m in enumerate(out.get("media", [])):
+        if m["kind"] not in kinds:
+            continue
+        ext = ".mp4" if m["kind"] == "generated_video" else ".png"
+        dest = os.path.join(save_dir, f"{m['kind']}_{result.conversation_id or 'new'}_{i}{ext}")
+        try:
+            local = _get_client().download_media(m["url"], dest)
+            m["local_path"] = local
+            saved.append(m)
+        except Exception as e:  # noqa: BLE001 - report download failure, keep URL
+            m["download_error"] = str(e)
+            saved.append(m)
+    out["saved_media"] = saved
+    return out
 
 
 @mcp.tool()

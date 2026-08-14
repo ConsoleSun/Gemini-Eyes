@@ -4,6 +4,7 @@ request construction and conversation RPCs (no network needed)."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -337,3 +338,139 @@ def test_init_requires_snlm0e():
             client.init(force=True)
     finally:
         gc.requests.Session = original
+
+
+# ---------------------------------------------------------------------------
+# Media: upload, generate-with-files, media parsing, download
+# ---------------------------------------------------------------------------
+
+def test_upload_file_posts_to_content_push(monkeypatch, tmp_path):
+    captured = {}
+    img = tmp_path / "photo.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\nfakepngdata")
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"t"}'})()
+
+        def post(self, url, files=None, headers=None, **kw):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["files"] = files
+            return type("R", (), {"status_code": 200, "text": "/contrib_service/ttl_1d/12345"})
+
+    import gemini_mcp.gemini_client as gc
+    monkeypatch.setattr(gc.requests, "Session", FakeSession)
+    client = GeminiWebClient({})
+    ident = client.upload_file(str(img))
+    assert ident == "/contrib_service/ttl_1d/12345"
+    assert captured["url"] == "https://content-push.googleapis.com/upload"
+    assert captured["headers"]["Push-ID"] == "feeds/mcudyrk2a4khkz"
+    assert captured["headers"]["X-Tenant-Id"] == "bard-storage"
+    filepart = captured["files"]["file"]
+    assert filepart[0] == "photo.png"
+    assert filepart[1] == b"\x89PNG\r\n\x1a\nfakepngdata"
+
+
+def test_upload_file_missing_path_raises():
+    client = GeminiWebClient({})
+    with pytest.raises(GeminiWebError):
+        client.upload_file("/nonexistent/file.png")
+
+
+def test_generate_with_files_embeds_file_data(monkeypatch, tmp_path):
+    captured = {}
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"pngdata")
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"tok"}'})()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, **kw):
+            if "upload" in url:
+                return type("R", (), {"status_code": 200, "text": "/contrib_service/x"})()
+
+            captured["data"] = data
+            return FakeResponse(
+                [_stream_frame(cid="c_1", rid="r_1", text="I see an image.", status=2)]
+            )
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    res = client.generate("what is this?", files=[str(img)])
+    assert res.text == "I see an image."
+    inner = json.loads(json.loads(captured["data"]["f.req"])[1])
+    assert inner[0][3] == [[["/contrib_service/x"], "pic.png"]]
+
+
+def test_consume_media_generated_image_and_video():
+    client = GeminiWebClient({})
+    result = GenerationResult()
+    # candidate with a generated image at [12][7][0] and a generated video at [12][59]
+    candidate = [None] * 40
+    candidate[0] = "rc_x"
+    candidate[1] = ["here is your image"]
+    candidate[8] = [2]
+    candidate[12] = [None] * 90
+    # generated image: [12][7][0] = list of gen_img_data, url = gen_img_data[0][3][3]
+    gen_img_data = [[None, None, None, [None, None, None,
+                     "http://googleusercontent.com/gen/1.png"]], "img_id"]
+    candidate[12][7] = [[gen_img_data]]
+    # generated video: [12][59][0][0][0] = video_info, url = video_info[0][7][1]
+    video_info = [[None, None, None, None, None, None, None,
+                   ["http://thumb.example/t.jpg", "http://video.example/v.mp4"]]]
+    candidate[12][59] = [[[video_info]]]
+    client._consume_frame(
+        ["wrb.fr", None, json.dumps([None, None, None, None, [candidate]])], result
+    )
+    kinds = [m.kind for m in result.media]
+    assert "generated_image" in kinds
+    assert "generated_video" in kinds
+    img = next(m for m in result.media if m.kind == "generated_image")
+    assert img.url == "http://googleusercontent.com/gen/1.png"
+    vid = next(m for m in result.media if m.kind == "generated_video")
+    assert vid.url == "http://video.example/v.mp4"
+
+
+def test_download_media_saves_file(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None})()
+            self.headers = {}
+
+        class MediaResponse:
+            status_code = 200
+            headers = {"content-type": "image/png"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def iter_content(self, chunk_size=0):
+                return iter([b"\x89PNG-data"])
+
+        def get(self, url, **kw):
+            if "gemini.google.com" in url:
+                return type("R", (), {"status_code": 200, "text": '{"SNlM0e":"t"}'})()
+            captured["url"] = url
+            return self.MediaResponse()
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    dest = client.download_media("http://googleusercontent.com/img.png", str(tmp_path / "out"))
+    assert captured["url"] == "http://googleusercontent.com/img.png"
+    assert Path(dest).read_bytes() == b"\x89PNG-data"
+    assert dest.endswith(".png")  # extension inferred from content-type

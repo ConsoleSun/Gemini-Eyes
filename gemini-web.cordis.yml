@@ -1,0 +1,27 @@
+# DSH (DeepSeek Harness) integration for gemini-web-mcp.
+#
+# Enable with:
+#   dsh web --patch /path/to/gemini-web.cordis.yml
+#
+# Tools will appear in DSH as mcp__gemini-web__gemini_send_message,
+# mcp__gemini-web__gemini_analyze_media, mcp__gemini-web__gemini_generate_image,
+# mcp__gemini-web__gemini_generate_video, ...
+#
+# Adjust `command` / `args` / `env` to match your machine. The cookie file
+# path below is an example; keep your real cookies OUT of git.
+- insert:
+    - id: gemini-web
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: gemini-web
+        transport: stdio
+        command: /home/ubuntuhong/.local/bin/uv
+        args:
+          - run
+          - --directory
+          - /home/ubuntuhong/Gemini Eyes/gemini-web-mcp
+          - gemini-mcp
+          - --browser
+          - chrome
+        env:
+          GEMINI_COOKIE_FILE: /tmp/gemini_cookies.json
