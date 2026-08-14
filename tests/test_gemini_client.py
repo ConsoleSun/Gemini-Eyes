@@ -442,10 +442,11 @@ def test_consume_media_generated_image_and_video():
     gen_img_data = [[None, None, None, [None, None, None,
                      "http://googleusercontent.com/gen/1.png"]], "img_id"]
     candidate[12][7] = [[gen_img_data]]
-    # generated video: [12][59][0][0][0] = video_info, url = video_info[0][7][1]
-    video_info = [[None, None, None, None, None, None, None,
-                   ["http://thumb.example/t.jpg", "http://video.example/v.mp4"]]]
-    candidate[12][59] = [[[video_info]]]
+    # generated video: [12][8]["60"][0][0][0][0][7] = [thumb, url, fallback]
+    candidate[12][8] = {"60": [[[[[None, 2, "video.mp4", None, None, None, None,
+                                   ["http://thumb.example/t.jpg",
+                                    "http://video.example/v.mp4",
+                                    "http://fallback.example/f.mp4"]]]]]]}
     client._consume_frame(
         ["wrb.fr", None, json.dumps([None, None, None, None, [candidate]])], result
     )

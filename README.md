@@ -159,6 +159,11 @@ uv run gemini-mcp --cookie-file cookies.json
 → 返回 {local_path: "./media/generated_image_xxx.png"}，把本地路径展示给用户
 ```
 
+> ⚠️ 生成额度：图片生成（Imagen）和视频生成（Veo）消耗账号的
+> **网页端生成额度**（免费账号有限额，设置页可查看）。额度用尽时 Gemini
+> 会在回复文本中说明。视频渲染通常需要 5~15 分钟，`gemini_generate_video`
+> 会轮询等待并自动下载成品。
+
 ---
 
 ## 接入 DSH（DeepSeek Harness）

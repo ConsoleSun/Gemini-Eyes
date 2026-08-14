@@ -404,14 +404,16 @@ class GeminiWebClient:
             url = get_nested(img, [0, 3, 3])
             if url:
                 result.media.append(MediaRef(kind="generated_image", url=url))
-        # Generated videos (Veo etc.)
-        video_info = get_nested(candidate, [12, 59, 0, 0, 0], [])
-        if video_info:
-            urls = get_nested(video_info, [0, 7], [])
+        # Generated videos (Veo etc.) — current web app layout:
+        # candidate[12][8]["60"][0][0][0][0] = [.., "video.mp4", .., [urls], ..]
+        # with urls = [thumbnail, real_download_url, fallback_url].
+        for path in ([12, 8, "60", 0, 0, 0, 0, 7], [12, 59, 0, 0, 0, 0, 7]):
+            urls = get_nested(candidate, path, [])
             if isinstance(urls, list) and len(urls) >= 2 and urls[1]:
                 result.media.append(
-                    MediaRef(kind="generated_video", url=urls[1], title=urls[0] or "")
+                    MediaRef(kind="generated_video", url=str(urls[1]), title=str(urls[0] or ""))
                 )
+                break
 
     def upload_file(self, path: str, filename: Optional[str] = None) -> list[Any]:
         """Upload a local file with the two-phase resumable protocol.
