@@ -1,5 +1,13 @@
 # gemini-web-mcp
 
+> ## ⚠️ 风险提示
+>
+> **此仓库仅用于学习交流，请合法使用，如遇任何问题与作者无关。**
+>
+> 本项目是对 Gemini 网页端内部接口的逆向封装，非官方 API；使用浏览器会话 Cookie
+> 自动化访问可能违反相关服务条款，请自行评估风险并遵守当地法律法规。
+> 请勿将本项目用于商业用途、批量抓取、绕过付费限制或任何侵犯他人权益的行为。
+
 **让 Agent 借 Gemini 的"眼睛"和"手"** —— 一个 MCP（Model Context Protocol）服务，把
 [gemini.google.com](https://gemini.google.com) 网页端的能力暴露给任何 Agent：
 

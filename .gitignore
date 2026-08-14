@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# uv
+uv.lock
+*.egg-info/
+dist/
+build/
+
+# Media generated at runtime
+media/
+*.mp4
+*.png
+!tests/**/*.png
+
+# Sensitive: never commit cookies or session data
+cookies*.json
+*_cookies.json
+.cached_cookies_*.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
