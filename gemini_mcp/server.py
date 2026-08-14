@@ -259,7 +259,11 @@ def gemini_send_message(
 @mcp.tool()
 def gemini_analyze_media(
     file_path: str,
-    prompt: str = "请详细描述这张图片/这个视频的内容，包括所有可见的细节。",
+    prompt: str = (
+        "请客观描述这张图片/这个视频的可见内容：画面主体与物品、场景与背景、"
+        "构图、光线与色彩风格、出现的文字或标识。请直接陈述视觉事实，"
+        "按条目分点说明。"
+    ),
     conversation_id: Optional[str] = None,
     response_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -268,9 +272,13 @@ def gemini_analyze_media(
     This is the tool an agent should call when the user uploads an image or
     video — Gemini looks at it and the result text comes back here.
 
+    Tip: the more specific the prompt, the more likely Gemini answers — if a
+    broad request is refused, retry with an objective angle (composition,
+    lighting, colors, objects, text).
+
     Args:
         file_path: Local path of the image or video file.
-        prompt: What to ask about the media (default: detailed description).
+        prompt: What to ask about the media (default: objective visual facts).
         conversation_id: Optional conversation to continue within.
 
     Returns:
