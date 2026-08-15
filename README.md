@@ -40,8 +40,12 @@ uv run python -m gemini_mcp.cookie_extractor --browser chrome --list --domain go
 > 新版浏览器改用 portal/app-bound 加密无法离线解密时，程序会明确提示，改用方式 B。
 
 **B. 手动导出**：用浏览器扩展（如 Cookie-Editor）导出 `gemini.google.com` 的全部
-Cookie 为 JSON，保存为 `cookies.json`。**全量导出、一个不落**；其中
-`__Secure-1PSID` 必带，浏览器里有 `__Secure-1PSIDTS` 则必须一起带。
+Cookie 为 JSON。**全量导出、一个不落**；其中 `__Secure-1PSID` 必带，浏览器里有
+`__Secure-1PSIDTS` 则必须一起带。保存位置三选一：
+
+- **默认路径** `~/.config/gemini-web-mcp/cookies.json` —— 服务自动读取，零配置
+- 任意路径 + 启动参数 `--cookie-file /path/to/cookies.json`
+- 任意路径 + 环境变量 `GEMINI_COOKIE_FILE`
 
 ### 2. 启动服务
 
@@ -61,7 +65,8 @@ uv run gemini-mcp --cookie-file cookies.json --transport http --port 8900
 
 - `GEMINI_EYES_UV` —— uv 的绝对路径（默认：PATH 上的 `uv`）
 - `GEMINI_EYES_DIR` —— 本仓库的绝对路径（默认：dsh 的当前工作目录）
-- `GEMINI_COOKIE_FILE` —— 手动导出的 cookies.json 路径（默认：从 Chrome 自动提取）
+- `GEMINI_COOKIE_FILE` —— 手动导出的 cookies.json 路径（默认：
+  `~/.config/gemini-web-mcp/cookies.json`，若存在；否则从 Chrome 自动提取）
 
 ```bash
 dsh plugin --profile demo add github:ConsoleSun/Gemini-Eyes

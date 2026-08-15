@@ -101,14 +101,41 @@ async def _run_http_async(host: str, port: int, token: Optional[str]) -> None:
     await uvicorn.Server(config).serve()
 
 
+# Well-known fallback cookie location: marketplace users just drop their
+# exported cookies.json here — no env vars or patch edits required.
+DEFAULT_COOKIE_FILE = Path.home() / ".config" / "gemini-web-mcp" / "cookies.json"
+
+# Whether the current session's cookies were loaded from a file (vs. browser
+# auto-extraction). _persist_cookies only writes when this is true or when an
+# explicit file path was configured — an auto-extract session must never
+# silently create a plaintext credential file.
+_cookies_from_file = False
+
+
+def _cookie_file_path() -> Optional[str]:
+    """Resolve the cookie file: CLI arg > GEMINI_COOKIE_FILE > default path."""
+    path = _cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
+    if path:
+        return path
+    return str(DEFAULT_COOKIE_FILE) if DEFAULT_COOKIE_FILE.is_file() else None
+
+
 def _load_cookies() -> tuple[dict[str, str], list[str]]:
-    """Load cookies: explicit file first, then auto-extract from browser."""
-    cookie_file = _cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
-    if cookie_file and Path(cookie_file).is_file():
-        raw = json.loads(Path(cookie_file).read_text(encoding="utf-8"))
+    """Load cookies: explicit file (CLI / env / default path) first, then
+    auto-extract from the local browser profile."""
+    global _cookies_from_file
+    _cookies_from_file = False
+    path = _cookie_file_path()
+    if path and Path(path).is_file():
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            return {}, [f"cookie file is not readable JSON: {path} ({e})"]
         if isinstance(raw, dict):
+            _cookies_from_file = True
             return raw, []
         if isinstance(raw, list):
+            _cookies_from_file = True
             return {c["name"]: c["value"] for c in raw if c.get("value")}, []
     return cookies_for_gemini(_browser, _profile)
 
@@ -128,8 +155,12 @@ def _get_client() -> GeminiWebClient:
 
 def _persist_cookies(client: GeminiWebClient) -> None:
     """Write the (rotated) session cookies back to the cookie file, so a
-    process restart keeps using fresh cookies."""
-    path = _cookie_file or os.environ.get("GEMINI_COOKIE_FILE")
+    process restart keeps using fresh cookies. Skips sessions that loaded
+    cookies purely from browser auto-extraction (no explicit file), so a
+    plaintext credential file is never created without the user's choice."""
+    if not (_cookies_from_file or _cookie_file or os.environ.get("GEMINI_COOKIE_FILE")):
+        return
+    path = _cookie_file_path()
     if not path:
         return
     entries = []
@@ -145,6 +176,7 @@ def _persist_cookies(client: GeminiWebClient) -> None:
             )
     if entries:
         try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
             Path(path).write_text(
                 json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -261,7 +293,7 @@ def gemini_status() -> dict[str, Any]:
                 if client._last_rotate_at else None
             ),
             "interval_seconds": _ROTATE_INTERVAL,
-            "persist_to": _cookie_file or os.environ.get("GEMINI_COOKIE_FILE"),
+            "persist_to": _cookie_file_path() if _cookies_from_file else None,
         }
     except Exception as e:  # noqa: BLE001 - diagnostics tool must not crash
         status["errors"] = [str(e)]

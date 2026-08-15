@@ -7,8 +7,9 @@
 # mcp__gemini-web__gemini_generate_video, ...
 #
 # Zero-config path: if none of the env vars below are set, the bridge uses
-# `uv` from PATH and the MCP server auto-extracts the Google session cookies
-# from your local Chrome profile (browser closed, logged in to
+# `uv` from PATH and the MCP server reads cookies from
+# ~/.config/gemini-web-mcp/cookies.json when present, else auto-extracts the
+# Google session from your local Chrome profile (browser closed, logged in to
 # gemini.google.com). New-browser app-bound encryption needs a manual export.
 #
 # Optional env vars (set them when launching `dsh web`):
@@ -17,7 +18,8 @@
 #                        (default: current directory — set it unless dsh runs
 #                        with this repo as its working directory)
 #   GEMINI_COOKIE_FILE   absolute path to your exported cookies.json
-#                        (default: auto-extract from Chrome)
+#                        (default: ~/.config/gemini-web-mcp/cookies.json if
+#                        present, else Chrome auto-extraction)
 - insert:
     - id: gemini-web
       name: '@deepseek-ai/dsh-mcp-client'

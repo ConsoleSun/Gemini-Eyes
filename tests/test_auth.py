@@ -67,3 +67,33 @@ def test_lifespan_scope_passes_through() -> None:
 
     asyncio.run(_TokenAuthMiddleware(app, "sekret")({"type": "lifespan"}, None, None))
     assert seen == ["lifespan"]
+
+
+def test_default_cookie_file_fallback(monkeypatch, tmp_path) -> None:
+    """Cookies at ~/.config/gemini-web-mcp/cookies.json load with zero config."""
+    import gemini_mcp.server as server
+
+    default = tmp_path / "cookies.json"
+    default.write_text('{"__Secure-1PSID": "v1"}', encoding="utf-8")
+    monkeypatch.setattr(server, "DEFAULT_COOKIE_FILE", default)
+    monkeypatch.setattr(server, "_cookie_file", None)
+    monkeypatch.delenv("GEMINI_COOKIE_FILE", raising=False)
+
+    cookies, errors = server._load_cookies()
+    assert cookies == {"__Secure-1PSID": "v1"}
+    assert errors == []
+    assert server._cookies_from_file is True
+
+
+def test_bad_cookie_json_reports_error(monkeypatch, tmp_path) -> None:
+    import gemini_mcp.server as server
+
+    bad = tmp_path / "cookies.json"
+    bad.write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(server, "_cookie_file", str(bad))
+    monkeypatch.delenv("GEMINI_COOKIE_FILE", raising=False)
+
+    cookies, errors = server._load_cookies()
+    assert cookies == {}
+    assert any("not readable JSON" in e for e in errors)
+    assert server._cookies_from_file is False
