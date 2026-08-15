@@ -6,17 +6,18 @@
 # mcp__gemini-web__gemini_analyze_media, mcp__gemini-web__gemini_generate_image,
 # mcp__gemini-web__gemini_generate_video, ...
 #
-# BEFORE installing: edit the three <PLACEHOLDERS> below for your machine
-# (keep the Python side installed first: `uv sync` in this repository), or
-# use the file as a template merged into your profile's own
-# ~/.dsh/profiles/<profile>/cordis.patch.yml.
+# Zero-config path: if none of the env vars below are set, the bridge uses
+# `uv` from PATH and the MCP server auto-extracts the Google session cookies
+# from your local Chrome profile (browser closed, logged in to
+# gemini.google.com). New-browser app-bound encryption needs a manual export.
 #
-#   <UV>            absolute path to uv, e.g. /home/you/.local/bin/uv
-#   <GEMINI_EYES>   absolute path to this repository checkout
-#   <COOKIES>       absolute path to your exported cookies.json
-#
-# Keep real cookies OUT of git — this file lives in a repo, so point
-# <COOKIES> at a private path outside the checkout.
+# Optional env vars (set them when launching `dsh web`):
+#   GEMINI_EYES_UV       absolute path to uv (default: `uv` on PATH)
+#   GEMINI_EYES_DIR      absolute path to this repository checkout
+#                        (default: current directory — set it unless dsh runs
+#                        with this repo as its working directory)
+#   GEMINI_COOKIE_FILE   absolute path to your exported cookies.json
+#                        (default: auto-extract from Chrome)
 - insert:
     - id: gemini-web
       name: '@deepseek-ai/dsh-mcp-client'
@@ -27,11 +28,10 @@
         # analysis and video generation regularly exceed that. 10 minutes
         # matches the server-side video polling budget (600s).
         toolCallTimeoutMs: 600000
-        command: <UV>
+        command: !!js process.env.GEMINI_EYES_UV || 'uv'
+        cwd: !!js process.env.GEMINI_EYES_DIR || ''
+        env:
+          GEMINI_COOKIE_FILE: !!js process.env.GEMINI_COOKIE_FILE || ''
         args:
           - run
-          - --directory
-          - <GEMINI_EYES>
           - gemini-mcp
-          - --cookie-file
-          - <COOKIES>

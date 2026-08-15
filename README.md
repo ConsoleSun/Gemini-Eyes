@@ -55,9 +55,13 @@ uv run gemini-mcp --cookie-file cookies.json --transport http --port 8900
 
 ### 3. 接入客户端
 
-**DeepSeek Harness（推荐）**：仓库根目录带有 DSH bundle 清单。把
-`cordis.patch.yml` 里的 `<UV>` / `<GEMINI_EYES>` / `<COOKIES>` 三个占位符换成实际路径
-（cookie 文件放仓库外，勿提交），然后：
+**DeepSeek Harness（推荐）**：仓库根目录带有 DSH bundle 清单，**开箱即用**——不设
+环境变量时走「`uv` + Chrome 自动提取 Cookie」的零配置路径；需要自定义时，在启动
+`dsh web` 前设置环境变量（任选）：
+
+- `GEMINI_EYES_UV` —— uv 的绝对路径（默认：PATH 上的 `uv`）
+- `GEMINI_EYES_DIR` —— 本仓库的绝对路径（默认：dsh 的当前工作目录）
+- `GEMINI_COOKIE_FILE` —— 手动导出的 cookies.json 路径（默认：从 Chrome 自动提取）
 
 ```bash
 dsh plugin --profile demo add github:ConsoleSun/Gemini-Eyes
