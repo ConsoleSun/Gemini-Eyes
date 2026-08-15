@@ -1,0 +1,37 @@
+# dsh-gemini-eyes-bundle: expose gemini-web-mcp tools to DeepSeek Harness.
+#
+# The bundle inserts one row for the in-box @deepseek-ai/dsh-mcp-client,
+# which spawns this repository's Python server over stdio. The tools then
+# appear in a session as mcp__gemini-web__gemini_send_message,
+# mcp__gemini-web__gemini_analyze_media, mcp__gemini-web__gemini_generate_image,
+# mcp__gemini-web__gemini_generate_video, ...
+#
+# BEFORE installing: edit the three <PLACEHOLDERS> below for your machine
+# (keep the Python side installed first: `uv sync` in this repository), or
+# use the file as a template merged into your profile's own
+# ~/.dsh/profiles/<profile>/cordis.patch.yml.
+#
+#   <UV>            absolute path to uv, e.g. /home/you/.local/bin/uv
+#   <GEMINI_EYES>   absolute path to this repository checkout
+#   <COOKIES>       absolute path to your exported cookies.json
+#
+# Keep real cookies OUT of git — this file lives in a repo, so point
+# <COOKIES> at a private path outside the checkout.
+- insert:
+    - id: gemini-web
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: gemini-web
+        transport: stdio
+        # mcp-client defaults each tool call to a 60s timeout; image/video
+        # analysis and video generation regularly exceed that. 10 minutes
+        # matches the server-side video polling budget (600s).
+        toolCallTimeoutMs: 600000
+        command: <UV>
+        args:
+          - run
+          - --directory
+          - <GEMINI_EYES>
+          - gemini-mcp
+          - --cookie-file
+          - <COOKIES>

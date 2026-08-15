@@ -299,6 +299,9 @@ class GeminiWebClient:
             resp = self.session.post(
                 ROTATE_COOKIES_URL,
                 headers=headers,
+                # Payload mirrored from the web app's cookie-rotation RPC:
+                # [000, "-" + <random uint64>]. The 000 prefix is the request
+                # id slot; any negative-looking numeric string is accepted.
                 data='[000,"-0000000000000000000"]',
                 timeout=self.timeout,
             )

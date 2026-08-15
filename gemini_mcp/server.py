@@ -23,6 +23,7 @@ Tools exposed:
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from mcp.server.mcpserver.server import MCPServer
+from mcp.server import MCPServer
 
 from .cookie_extractor import cookies_for_gemini
 from .gemini_client import DEFAULT_METADATA, MediaRef, GeminiWebClient, GeminiWebError
@@ -50,6 +51,54 @@ _metadata_cache: dict[str, list[Any]] = {}  # conversation_id -> metadata
 
 # How often to rotate __Secure-1PSIDTS in the background (seconds).
 _ROTATE_INTERVAL = 25 * 60
+
+
+class _TokenAuthMiddleware:
+    """ASGI middleware requiring ``Authorization: Bearer <token>`` on HTTP.
+
+    Only HTTP requests are gated; lifespan and websocket scopes pass through
+    untouched. ``token=None`` disables the check (opt-in via
+    ``--http-allow-anonymous``). The comparison is constant-time.
+    """
+
+    def __init__(self, app: Any, token: Optional[str]) -> None:
+        self.app = app
+        self._expected = b"Bearer " + token.encode() if token else None
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and self._expected is not None:
+            headers = dict(scope.get("headers") or [])
+            if not hmac.compare_digest(
+                headers.get(b"authorization", b""), self._expected
+            ):
+                await self._deny(send)
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _deny(send: Any) -> None:
+        body = b'{"error": "invalid_token", "error_description": "Authentication required"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", b'Bearer error="invalid_token"'),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+async def _run_http_async(host: str, port: int, token: Optional[str]) -> None:
+    """Run the streamable-http transport behind the bearer-token middleware."""
+    import uvicorn
+
+    app = _TokenAuthMiddleware(mcp.streamable_http_app(host=host), token)
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
 
 
 def _load_cookies() -> tuple[dict[str, str], list[str]]:
@@ -490,6 +539,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                         help="MCP transport (default: stdio).")
     parser.add_argument("--port", type=int, default=8900,
                         help="HTTP port when --transport http (default: 8900).")
+    parser.add_argument("--http-token", default=None,
+                        help="Bearer token required for --transport http. Defaults to "
+                             "GEMINI_HTTP_TOKEN, then to a randomly generated token "
+                             "printed at startup.")
+    parser.add_argument("--http-allow-anonymous", action="store_true",
+                        help="Disable HTTP token auth. DANGEROUS: any local process "
+                             "(and any website you visit) can drive the logged-in "
+                             "Google account through the HTTP port.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args(argv)
 
@@ -511,10 +568,23 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.transport == "http":
         import asyncio
+        import secrets
 
-        asyncio.run(
-            mcp.run_streamable_http_async(host="127.0.0.1", port=args.port)
-        )
+        token: Optional[str] = args.http_token or os.environ.get("GEMINI_HTTP_TOKEN")
+        if args.http_allow_anonymous:
+            token = None
+            log.warning(
+                "HTTP token auth disabled (--http-allow-anonymous): any local "
+                "process can drive this logged-in Google account."
+            )
+        elif not token:
+            token = secrets.token_urlsafe(24)
+            print(
+                f"gemini-web-mcp HTTP auth token (send as `Authorization: Bearer "
+                f"{token}`):",
+                flush=True,
+            )
+        asyncio.run(_run_http_async("127.0.0.1", args.port, token))
     else:
         import asyncio
 

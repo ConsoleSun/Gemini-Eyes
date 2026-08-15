@@ -1,0 +1,11 @@
+{
+  "name": "dsh-gemini-eyes-bundle",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek Harness bundle that mounts gemini-web-mcp as mcp__gemini-web__* tools",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
