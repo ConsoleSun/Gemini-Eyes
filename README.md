@@ -1,3 +1,5 @@
+
+
 # gemini-web-mcp
 
 **让 Agent 用上 Gemini 的「眼睛」和「手」** —— 一个 MCP 服务，把
@@ -74,6 +76,8 @@ dsh --profile demo
 ```
 
 新开会话后工具以 `mcp__gemini-web__*` 出现。
+
+DSH bundle 已把 `toolCallTimeoutMs` 设为 `600000` 毫秒（10 分钟），以覆盖 mcp-client 默认的 60 秒超时。
 
 **Claude Desktop / Cline / 其他**：标准 MCP 配置，`command` + `args` 指向
 `gemini-mcp --cookie-file /path/to/cookies.json`（stdio），或 HTTP 模式填
