@@ -23,6 +23,7 @@ Tools exposed:
 from __future__ import annotations
 
 import argparse
+import glob
 import hmac
 import json
 import logging
@@ -347,6 +348,87 @@ def gemini_send_message(
     _remember(result)
     return result.to_dict()
 
+
+MAX_REVIEW_FILES = 20
+MAX_REVIEW_BYTES = 2_000_000
+
+
+def _resolve_review_paths(patterns: list[str]) -> list[str]:
+    """Expand globs / env vars into a de-duplicated list of real files."""
+    resolved: list[str] = []
+    for pattern in patterns:
+        expanded = os.path.expandvars(os.path.expanduser(pattern))
+        matches = sorted(glob.glob(expanded, recursive=True))
+        candidates = matches if matches else [expanded]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                resolved.append(os.path.abspath(candidate))
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in resolved:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+@mcp.tool()
+def gemini_review(
+    paths: list[str],
+    question: str,
+    conversation_id: Optional[str] = None,
+    response_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Upload local source files to Gemini and ask it to review them.
+
+    Practical alternative to Gemini's GitHub import on the web interface: that
+    import hands the model a compressed binary blob it cannot read, whereas
+    uploading the files themselves works. Globs are expanded, so
+    ``["src/**/*.py"]`` is valid.
+
+    Args:
+        paths: Files or glob patterns to upload (each <= 2 MB, at most 20 files).
+        question: What to ask about them, e.g. "review these for bugs".
+        conversation_id: Continue an earlier review (from a previous result).
+        response_id: Response id to reply under, if continuing.
+
+    Returns:
+        The answer plus ``model`` (the tier that actually served it) and
+        ``files`` / ``skipped`` describing what was uploaded.
+    """
+    if not question or not question.strip():
+        raise ValueError("question must not be empty")
+    if not paths:
+        raise ValueError("paths must not be empty")
+
+    selected: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    for path in _resolve_review_paths(paths):
+        try:
+            size = os.path.getsize(path)
+        except OSError as error:
+            skipped.append({"path": path, "reason": str(error)})
+            continue
+        if size > MAX_REVIEW_BYTES:
+            skipped.append({"path": path, "reason": "larger than %d bytes" % MAX_REVIEW_BYTES})
+            continue
+        if len(selected) >= MAX_REVIEW_FILES:
+            skipped.append({"path": path, "reason": "more than %d files" % MAX_REVIEW_FILES})
+            continue
+        selected.append(path)
+    if not selected:
+        raise ValueError("no uploadable files matched")
+
+    client = _get_client()
+    meta = _metadata_for(conversation_id, response_id)
+    started = time.time()
+    result = client.generate(question.strip(), metadata=meta, files=selected)
+    payload = result.to_dict()
+    payload["files"] = [{"path": p, "bytes": os.path.getsize(p)} for p in selected]
+    payload["skipped"] = skipped
+    payload["elapsed_seconds"] = round(time.time() - started, 2)
+    return payload
 
 @mcp.tool()
 def gemini_analyze_media(

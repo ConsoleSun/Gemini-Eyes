@@ -854,3 +854,234 @@ def test_fallback_env_accepts_comma_separated_chain(monkeypatch):
         None,
     ]
 
+
+# ---------------------------------------------------------------------------
+# Regression: frame duplication (feed() must return only *new* frames)
+# ---------------------------------------------------------------------------
+
+def test_feed_returns_only_frames_parsed_from_this_chunk():
+    p = FrameParser()
+    first = p.feed(_frame([["a"]]))
+    assert first == [["a"]]
+    # Second chunk: the old implementation returned *both* frames here.
+    second = p.feed(_frame([["b"]]))
+    assert second == [["b"]]
+    # self.frames stays as the debug accumulator (unchanged public field).
+    assert p.frames == [["a"], ["b"]]
+
+
+def test_feed_split_mid_frame_returns_nothing_until_complete():
+    p = FrameParser()
+    raw = _frame([[1, 2, 3]])
+    assert p.feed(raw[:5]) == []  # digits/length prefix only
+    assert p.frames == []
+    assert p.feed(raw[5:]) == [[1, 2, 3]]
+    assert p.frames == [[1, 2, 3]]
+
+
+def test_feed_one_char_at_a_time_handles_utf16_surrogates():
+    # Emoji frame fed byte-by-byte: the length budget walk must not overshoot
+    # (a 4-byte emoji counts as 2 UTF-16 units) and must stay resumable.
+    payload = [["wrb.fr", None, "你好👋", None]]
+    s = json.dumps(payload, ensure_ascii=False)
+    units = sum(2 if ord(ch) > 0xFFFF else 1 for ch in s)
+    raw = f"{units + 2}\n\n{s}\n"
+    p = FrameParser()
+    got = []
+    for i in range(len(raw)):
+        got.extend(p.feed(raw[i]))
+    assert got == [payload[0]]
+    assert p._buf == ""  # no leftover, no over-advance
+
+
+def _media_stream_frame(url, text="hi", status=1, cid="c_m", rid="r_m", rcid="rc_m"):
+    """A StreamGenerate frame whose candidate carries one generated image."""
+    inner: list = [None] * 43
+    inner[1] = [cid, rid]
+    candidate = [None] * 40
+    candidate[0] = rcid
+    candidate[1] = [text]
+    candidate[8] = [status]
+    candidate[12] = [None] * 90
+    gen_img_data = [[None, None, None, [None, None, None, url]], "img_id"]
+    candidate[12][7] = [[gen_img_data]]
+    inner[4] = [candidate]
+    return ["wrb.fr", None, json.dumps(inner), None, None, None, "generic"]
+
+
+def test_generate_does_not_reprocess_frames_across_chunks(monkeypatch):
+    frames = [
+        _media_stream_frame("http://googleusercontent.com/gen/dup.png", text="here", status=1),
+        _media_stream_frame("http://googleusercontent.com/gen/dup.png", text="here is", status=1),
+        _media_stream_frame("http://googleusercontent.com/gen/dup.png", text="here it is", status=2),
+    ]
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            return FakeResponse(frames)
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    client = GeminiWebClient({})
+    seen = []
+    res = client.generate("go", on_frame=seen.append)
+
+    # Three frames on the wire -> three raw frames, three callbacks (not 3+2+1).
+    assert len(res.raw_frames) == 3
+    assert len(seen) == 3
+    # The same image repeated by every frame collapses to one media entry.
+    assert [m.url for m in res.media] == ["http://googleusercontent.com/gen/dup.png"]
+    assert res.text == "here it is"
+    assert res.completed is True
+
+
+def test_consume_media_deduplicates_same_kind_and_url():
+    candidate = [None] * 40
+    candidate[0] = "rc_x"
+    candidate[1] = ["answer"]
+    candidate[12] = [None] * 90
+    gen_img_data = [[None, None, None, [None, None, None, "http://x/1.png"]], "id"]
+    candidate[12][7] = [[gen_img_data]]
+    client = GeminiWebClient({})
+    result = GenerationResult()
+    frame = ["wrb.fr", None, json.dumps([None, None, None, None, [candidate]])]
+    client._consume_frame(frame, result)
+    client._consume_frame(frame, result)  # same candidate seen again
+    assert len(result.media) == 1
+    assert result.media[0].url == "http://x/1.png"
+
+
+# ---------------------------------------------------------------------------
+# Regression: transport errors + session self-healing (defect B)
+# ---------------------------------------------------------------------------
+
+def _session_with_cookies():
+    """Fake session jar holding the two session cookies the client needs."""
+    return type("J", (), {
+        "set": lambda *a, **k: None,
+        "__iter__": lambda self: iter([
+            type("C", (), {"name": "__Secure-1PSID", "value": "psid",
+                           "domain": ".google.com", "path": "/"}),
+            type("C", (), {"name": "__Secure-1PSIDTS", "value": "ts",
+                           "domain": ".google.com", "path": "/"}),
+        ]),
+    })()
+
+
+def test_generate_wraps_transport_error_and_retries_with_backoff(monkeypatch):
+    import requests as requests_module
+
+    stream_posts = []
+    delays = []
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = _session_with_cookies()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            if "StreamGenerate" not in url:
+                return _StatusResponse(200)  # RotateCookies
+            stream_posts.append(url)
+            if len(stream_posts) == 1:
+                raise requests_module.ConnectionError("connection reset mid-stream")
+            return FakeResponse([_stream_frame(text="recovered", status=2)])
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    monkeypatch.setattr(
+        "gemini_mcp.gemini_client.time.sleep", lambda s: delays.append(s)
+    )
+    client = GeminiWebClient({})
+    res = client.generate("ping")
+    assert res.text == "recovered"
+    assert delays == [0.8]  # first retry uses the first configured delay
+    assert len(stream_posts) == 2
+
+
+def test_generate_heals_stale_session_on_http_400_once(monkeypatch):
+    stream_attempts = []
+    rotates = []
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = _session_with_cookies()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            if "RotateCookies" in url:
+                rotates.append(url)
+                return _StatusResponse(200)
+            stream_attempts.append(url)
+            if len(stream_attempts) == 1:
+                return _StatusResponse(400)
+            return FakeResponse([_stream_frame(text="after heal", status=2)])
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    monkeypatch.setattr("gemini_mcp.gemini_client.time.sleep", lambda s: None)
+    client = GeminiWebClient({})
+    res = client.generate("ping")
+    assert res.text == "after heal"
+    assert len(stream_attempts) == 2  # original + one post-heal retry
+    assert rotates  # cookies were force-rotated before the retry
+
+
+def test_generate_gives_up_after_bounded_retries(monkeypatch):
+    import requests as requests_module
+
+    stream_attempts = []
+    delays = []
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = _session_with_cookies()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            if "StreamGenerate" not in url:
+                return _StatusResponse(200)  # RotateCookies
+            stream_attempts.append(url)
+            raise requests_module.Timeout("read timed out")
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    monkeypatch.setattr(
+        "gemini_mcp.gemini_client.time.sleep", lambda s: delays.append(s)
+    )
+    client = GeminiWebClient({}, model="legacy")
+    with pytest.raises(GeminiWebError) as exc:
+        client.generate("ping")
+    assert exc.value.transport is True
+    # legacy chain = 1 plan: bounded by TRANSIENT_RETRY_ATTEMPTS (2), no hang.
+    assert len(stream_attempts) == 3
+    assert delays == [0.8, 2.0]
+    assert "timed out" in str(exc.value).lower()
+    assert isinstance(exc.value.__cause__, requests_module.RequestException)
+
+
+class _StatusResponse:
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
