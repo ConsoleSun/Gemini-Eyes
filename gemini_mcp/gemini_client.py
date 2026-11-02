@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import random
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, Union
 
 import requests
 
@@ -52,6 +53,204 @@ FILES_ENUM_INT = {
 
 # Default 10-slot metadata used for brand-new conversations (mirrors the web app).
 DEFAULT_METADATA: list[Any] = ["", "", "", None, None, None, None, None, None, ""]
+
+# ---------------------------------------------------------------------------
+# Model selection
+# ---------------------------------------------------------------------------
+#
+# The web app picks a model through a side channel header. Without it the
+# server silently answers with the account's default (Flash tier), no matter
+# what the request payload says — measured on 2026-11-02: the payload's model
+# slot alone (inner[79]) was ignored, while adding this header routed the same
+# prompt to "3.1 Pro" (echoed back by the server at response inner[42]).
+#
+# ``x-goog-ext-525001261-jspb`` is a JSON list (zero-based indices):
+#
+#   4  model id hash            11  capacity / subscription tier
+#   8  client capabilities      14  model number (routing key)
+#   15 thinking level           16  request/session uuid
+#
+# The same model number is mirrored into the request payload at inner[79]
+# (the front-end MODE_CATEGORY enum) and the thinking level at inner[80].
+MODEL_HEADER_KEY = "x-goog-ext-525001261-jspb"
+
+# (model_id, capacity, model_number) as observed on the 2026-11 web lineup.
+# model_number == MODE_CATEGORY: 1=Flash, 2=Thinking, 3=Pro, 4=Auto,
+# 5=dynamic thinking, 6=Flash-Lite, 8=Argon (Gemini 4).
+MODEL_CATALOG: dict[str, tuple[str, int, int]] = {
+    # Gemini 4 "Argon" — the highest tier the web UI now exposes. Measured
+    # 2026-11-02: number 8 served as "4 Argon High" at thinking 2; the hash
+    # and capacity slots do not change the routing (all catalog hashes and
+    # capacities 1/4 answered "4 Argon"), so the Pro hash is reused.
+    "argon": ("e6fa609c3fa255c0", 4, 8),
+    # Gemini 3.1 Pro — second tier, kept as the first fallback.
+    "pro": ("e6fa609c3fa255c0", 4, 3),
+    "pro-advanced": ("e6fa609c3fa255c0", 2, 3),
+    "pro-basic": ("9d8ca3786ebdfbea", 1, 3),
+    # Flash / Flash-Lite — used as fallbacks when Pro is not usable.
+    "flash": ("56fdd199312815e2", 4, 1),
+    "flash-basic": ("fbb127bbb056c959", 1, 1),
+    "flash-lite": ("8c46e95b1a07cecc", 4, 6),
+    "flash-lite-basic": ("cf41b0e0dd7d53e5", 1, 6),
+}
+
+# User-facing aliases (also used with the "gemini-" prefix stripped).
+MODEL_ALIASES: dict[str, str] = {
+    "highest": "argon",
+    "max": "argon",
+    "4-argon": "argon",
+    "argon-4": "argon",
+    "4argon": "argon",
+    "4": "argon",  # gemini-4 -> "4" after the prefix strip
+    "3.1-pro": "pro",
+    "3-pro": "pro",
+    "pro-plus": "pro",
+    "3.8-flash": "flash",
+    "3.6-flash": "flash",
+    "3.5-flash": "flash",
+    "lite": "flash-lite",
+    "legacy": "legacy",
+    "default": "legacy",
+    "off": "legacy",
+    "none": "legacy",
+    "disabled": "legacy",
+}
+
+# Highest tier by default: Gemini 4 "Argon".
+DEFAULT_MODEL = "argon"
+# Fallback chain when a tier is rejected (1037 usage limit / 1052 model
+# unavailable): Argon -> 3.1 Pro -> Flash-Basic -> legacy model-less request.
+# DEFAULT_MODEL_FALLBACK is kept as the single-step default (backward compat);
+# the chain below is what the client actually walks.
+DEFAULT_MODEL_FALLBACK = "pro"
+DEFAULT_MODEL_FALLBACK_CHAIN: tuple[str, ...] = ("pro", "flash-basic")
+
+# Native thinking levels (header index 15 / inner[80]):
+#   1 = standard, 2 = extended, 3 = deep think.
+# Level 3 ("Deep Think") is asynchronous: the first response is only a
+# "processing, check back later" placeholder, so the highest level that still
+# answers synchronously is 2 — hence the default.
+THINKING_LEVELS: dict[str, int] = {
+    "standard": 1,
+    "low": 1,
+    "minimal": 1,
+    "extended": 2,
+    "medium": 2,
+    "high": 2,
+    "max": 2,
+    "highest": 2,
+    "deep": 3,
+    "deep_think": 3,
+    "deepthink": 3,
+}
+DEFAULT_THINKING = 2
+
+# Server-side error codes that mean "this model setting is not usable here".
+# 1037 = usage limit for this model/account, 1052 = model header invalid or
+# model unavailable. Both are retried with the next configured candidate.
+MODEL_RETRY_CODES = frozenset({1037, 1052})
+# 1050 = the conversation already carries a different model; only the legacy
+# (model-less) request can continue it.
+CONVERSATION_MODEL_CONFLICT = 1050
+
+
+@dataclass(frozen=True)
+class ModelSetting:
+    """One concrete model selection: catalog entry plus thinking level."""
+
+    label: str
+    model_id: str
+    capacity: int
+    model_number: int
+    thinking: int
+
+    def to_headers(self, session_id: str) -> dict[str, str]:
+        """Build the side-channel request headers for this setting."""
+        header = (
+            f'[1,null,null,null,"{self.model_id}",null,null,0,[4,5,6,8],'
+            f"null,null,{self.capacity},null,null,{self.model_number},"
+            f'{self.thinking},"{session_id}"]'
+        )
+        return {
+            MODEL_HEADER_KEY: header,
+            "x-goog-ext-73010989-jspb": "[0]",
+            "x-goog-ext-73010990-jspb": "[0,0,0]",
+            "x-goog-ext-525005358-jspb": f'["{session_id}",1]',
+        }
+
+
+def _normalise_model_name(raw: str) -> str:
+    key = raw.strip().lower().replace("_", "-")
+    if key.startswith("gemini-"):
+        key = key[len("gemini-") :]
+    return MODEL_ALIASES.get(key, key)
+
+
+def resolve_thinking_level(raw: Optional[Union[int, str]], default: int = DEFAULT_THINKING) -> int:
+    """Map a user-provided thinking depth to the native level (1/2/3)."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):  # bool is an int subclass — treat True as default
+        return default
+    if isinstance(raw, int):
+        return raw if raw in (1, 2, 3) else default
+    key = str(raw).strip().lower().replace("-", "_")
+    if not key:
+        return default
+    if key in ("true", "on", "yes"):
+        return default
+    if key in ("false", "no"):
+        return 1
+    if key in THINKING_LEVELS:
+        return THINKING_LEVELS[key]
+    try:
+        value = int(key)
+    except ValueError:
+        return default
+    return value if value in (1, 2, 3) else default
+
+
+def resolve_model_setting(
+    model: Optional[str] = None,
+    thinking: Optional[Union[int, str]] = None,
+    capacity: Optional[Union[int, str]] = None,
+) -> Optional[ModelSetting]:
+    """Resolve a model name into a request setting.
+
+    ``model`` accepts catalog names (``argon``, ``pro``, ``flash``, ``flash-lite``, ...),
+    their ``gemini-*`` aliases, or a legacy switch (``legacy``/``default``/
+    ``off``), which returns ``None``: the request then stays byte-for-byte the
+    pre-model-selection payload (whatever the web app defaults to).
+
+    Unknown names fall back to ``DEFAULT_MODEL`` (highest tier) so a typo in an
+    env var degrades to the intended behaviour instead of the old default.
+    """
+    key = _normalise_model_name(model if model is not None else DEFAULT_MODEL)
+    if key == "legacy":
+        return None
+    entry = MODEL_CATALOG.get(key)
+    if entry is None:
+        key = DEFAULT_MODEL
+        entry = MODEL_CATALOG[key]
+    model_id, default_capacity, model_number = entry
+
+    cap = default_capacity
+    if capacity is not None and str(capacity).strip():
+        try:
+            requested = int(str(capacity).strip())
+        except ValueError:
+            requested = 0
+        if 1 <= requested <= 4:
+            cap = requested
+
+    return ModelSetting(
+        label=key,
+        model_id=model_id,
+        capacity=cap,
+        model_number=model_number,
+        thinking=resolve_thinking_level(thinking),
+    )
+
 
 HEADERS = {
     "User-Agent": (
@@ -113,6 +312,9 @@ class GenerationResult:
     media: list[MediaRef] = field(default_factory=list)
     raw_frames: list[Any] = field(default_factory=list)
     elapsed: float = 0.0
+    # Model name the server says produced this answer (response inner[42],
+    # e.g. "3.1 Pro"). Empty when the server did not report one.
+    model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -124,6 +326,7 @@ class GenerationResult:
             "completed": self.completed,
             "media": [m.to_dict() for m in self.media],
             "elapsed_seconds": round(self.elapsed, 2),
+            "model": self.model,
         }
 
 
@@ -208,12 +411,48 @@ class GeminiWebClient:
         timeout: float = 180.0,
         token_ttl: float = 1800.0,
         on_frame: Optional[Callable[[Any], None]] = None,
+        model: Optional[str] = None,
+        thinking: Optional[Union[int, str]] = None,
+        model_capacity: Optional[Union[int, str]] = None,
+        model_fallback: Optional[str] = None,
     ) -> None:
         self.cookies = cookies
         self.language = language
         self.timeout = timeout
         self.token_ttl = token_ttl
         self.on_frame = on_frame  # optional streaming hook
+
+        # Model selection: explicit arguments win over the environment.
+        # GEMINI_MODEL=legacy (or "default"/"off") restores the pre-model
+        # behaviour exactly; every other value selects a model header.
+        if model is None:
+            model = os.environ.get("GEMINI_MODEL")
+        if thinking is None:
+            thinking = os.environ.get("GEMINI_THINKING")
+        if model_capacity is None:
+            model_capacity = os.environ.get("GEMINI_MODEL_CAPACITY")
+        if model_fallback is None:
+            model_fallback = os.environ.get("GEMINI_MODEL_FALLBACK")
+        if model_fallback is None or not str(model_fallback).strip():
+            fallback_names = list(DEFAULT_MODEL_FALLBACK_CHAIN)
+        else:
+            # GEMINI_MODEL_FALLBACK accepts a comma-separated chain
+            # (e.g. "pro,flash-basic"); a single name keeps working.
+            fallback_names = [name for name in str(model_fallback).split(",") if name.strip()]
+
+        self.model_setting = resolve_model_setting(model, thinking, model_capacity)
+        if self.model_setting is None:
+            # Legacy opt-out: one request, model-less payload, exactly as before.
+            self.model_chain: list[Optional[ModelSetting]] = [None]
+        else:
+            chain: list[Optional[ModelSetting]] = [self.model_setting]
+            for name in fallback_names:
+                setting = resolve_model_setting(name, thinking, model_capacity)
+                if setting is not None and setting not in chain:
+                    chain.append(setting)
+            # Last resort: the legacy payload (web default) still answers.
+            chain.append(None)
+            self.model_chain = chain
 
         self.session = requests.Session()
         for name, value in cookies.items():
@@ -351,17 +590,105 @@ class GeminiWebClient:
         files: Optional[list[str]] = None,
         on_frame: Optional[Callable[[Any], None]] = None,
     ) -> GenerationResult:
-        """Send one prompt (optionally with attached files) and collect the streamed answer."""
+        """Send one prompt (optionally with attached files) and collect the streamed answer.
+
+        Model and thinking depth come from ``self.model_chain`` (configured via
+        the constructor arguments or ``GEMINI_MODEL`` / ``GEMINI_THINKING``).
+        When the server rejects a candidate (usage limit, model unavailable) the
+        next one is tried — fallback model, then the legacy model-less request —
+        so an over-ambitious default degrades instead of breaking the tool.
+        """
         self.ensure_fresh()
         self.init()
         start = time.time()
-        result = GenerationResult()
 
         file_data = None
         if files:
             file_data = [self.upload_file(path) for path in files]
 
-        inner: list[Any] = [None] * 69
+        plans = self.model_chain
+        index = 0
+        last_error: Optional[GeminiWebError] = None
+        while index < len(plans):
+            plan = plans[index]
+            index += 1
+            try:
+                result = self._generate_once(prompt, metadata, file_data, plan, on_frame)
+            except GeminiWebError as exc:
+                last_error = exc
+                if exc.code == CONVERSATION_MODEL_CONFLICT:
+                    # The conversation already carries another model; only the
+                    # legacy (model-less) request can continue it.
+                    while index < len(plans) and plans[index] is not None:
+                        index += 1
+                    if index >= len(plans):
+                        raise
+                    continue
+                if exc.code in MODEL_RETRY_CODES and index < len(plans):
+                    continue
+                raise
+            result.elapsed = time.time() - start
+            return result
+        raise last_error  # pragma: no cover - plans is never empty
+
+    def _generate_once(
+        self,
+        prompt: str,
+        metadata: Optional[list[Any]],
+        file_data: Any,
+        plan: Optional[ModelSetting],
+        on_frame: Optional[Callable[[Any], None]],
+    ) -> GenerationResult:
+        """One StreamGenerate round trip for one model plan (None = legacy)."""
+        result = GenerationResult()
+        session_uuid = str(uuid.uuid4()).upper()
+        inner = self._build_inner(prompt, metadata, file_data, plan, session_uuid)
+        headers = plan.to_headers(session_uuid) if plan is not None else None
+
+        params = {**self._params(), "_reqid": self._next_reqid()}
+        body = {
+            "at": self.access_token,
+            "f.req": json.dumps([None, json.dumps(inner)]),
+        }
+        request: dict[str, Any] = {
+            "params": params,
+            "data": body,
+            "stream": True,
+            "timeout": self.timeout,
+        }
+        if headers:
+            request["headers"] = headers
+
+        parser = FrameParser()
+        with self.session.post(GENERATE_URL, **request) as resp:
+            if resp.status_code != 200:
+                raise GeminiWebError(
+                    f"StreamGenerate failed: HTTP {resp.status_code}. "
+                    "Token may be stale — try again after a page refresh in the browser.",
+                    code=resp.status_code,
+                )
+            for chunk in resp.iter_content(chunk_size=16384, decode_unicode=True):
+                if not chunk:
+                    continue
+                for frame in parser.feed(chunk):
+                    result.raw_frames.append(frame)
+                    if on_frame:
+                        on_frame(frame)
+                    self._consume_frame(frame, result)
+        return result
+
+    def _build_inner(
+        self,
+        prompt: str,
+        metadata: Optional[list[Any]],
+        file_data: Any,
+        plan: Optional[ModelSetting],
+        session_uuid: str,
+    ) -> list[Any]:
+        # Legacy requests keep the historical 69-slot shape; model-selected
+        # requests grow to 81 slots because inner[79]/inner[80] carry the mode
+        # and thinking level.
+        inner: list[Any] = [None] * (69 if plan is None else 81)
         inner[0] = [prompt, 0, None, file_data, None, None, 0]
         inner[1] = [self.language]
         inner[2] = metadata or DEFAULT_METADATA.copy()
@@ -377,35 +704,28 @@ class GeminiWebClient:
         inner[53] = 0
         inner[61] = []
         inner[68] = 2
-        inner[59] = str(uuid.uuid4()).upper()
+        inner[59] = session_uuid
+        if plan is not None:
+            inner[79] = plan.model_number
+            inner[80] = plan.thinking
+        return inner
 
-        params = {**self._params(), "_reqid": self._next_reqid()}
-        body = {
-            "at": self.access_token,
-            "f.req": json.dumps([None, json.dumps(inner)]),
+    @property
+    def model_description(self) -> dict[str, Any]:
+        """Diagnostic description of the model chain (used by gemini_status)."""
+        if self.model_setting is None:
+            return {"model": "legacy", "note": "no model header sent (web app default)"}
+        return {
+            "model": self.model_setting.label,
+            "model_id": self.model_setting.model_id,
+            "model_number": self.model_setting.model_number,
+            "capacity": self.model_setting.capacity,
+            "thinking_level": self.model_setting.thinking,
+            "fallbacks": [
+                plan.label if plan is not None else "legacy"
+                for plan in self.model_chain[1:]
+            ],
         }
-
-        parser = FrameParser()
-        with self.session.post(
-            GENERATE_URL, params=params, data=body, stream=True, timeout=self.timeout
-        ) as resp:
-            if resp.status_code != 200:
-                raise GeminiWebError(
-                    f"StreamGenerate failed: HTTP {resp.status_code}. "
-                    "Token may be stale — try again after a page refresh in the browser.",
-                    code=resp.status_code,
-                )
-            for chunk in resp.iter_content(chunk_size=16384, decode_unicode=True):
-                if not chunk:
-                    continue
-                for frame in parser.feed(chunk):
-                    result.raw_frames.append(frame)
-                    if on_frame:
-                        on_frame(frame)
-                    self._consume_frame(frame, result)
-
-        result.elapsed = time.time() - start
-        return result
 
     def _consume_frame(self, frame: Any, result: GenerationResult) -> None:
         # Error check: frames may carry [.., [5, [2, [0, [1, [0, code]]]]]]-ish paths.
@@ -434,6 +754,11 @@ class GeminiWebClient:
             if rid:
                 result.response_id = str(rid)
             result.metadata = m_data
+
+        # model that produced the answer, e.g. "3.1 Pro" / "3.5 Flash-Lite"
+        served_model = get_nested(inner, [42])
+        if isinstance(served_model, str) and served_model:
+            result.model = served_model
 
         # final chunk marker (conversation saved)
         ctx = get_nested(inner, [25])

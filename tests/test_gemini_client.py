@@ -85,13 +85,15 @@ def test_frame_parser_partial_then_rest():
 # ---------------------------------------------------------------------------
 
 def _stream_frame(cid="c_abc", rid="r_123", rcid="rc_456", text="hi there",
-                  status=1, thoughts="", error_code=None):
-    inner: list = [None] * 30
+                  status=1, thoughts="", error_code=None, model=""):
+    inner: list = [None] * 43
     inner[1] = [cid, rid]
     inner[4] = [[rcid, [text], None, None, None, None, None, None, [status], None,
                  None, None, None, None, None, None, None, None, None, None, None,
                  None, None, None, None, None, None, None, None, None, None, None,
                  None, None, None, None, None, thoughts and [[thoughts]] or None]]
+    if model:
+        inner[42] = model  # response slot carrying the serving model name
     frame = ["wrb.fr", None, json.dumps(inner), None, None, None, "generic"]
     if error_code is not None:
         # Error frames carry the code at part[5][2][0][1][0].
@@ -165,10 +167,11 @@ def test_generate_uses_browser_shaped_request(monkeypatch):
             captured["init_url"] = url
             return _FakeInitResponse()
 
-        def post(self, url, params=None, data=None, stream=None, timeout=None):
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
             captured["post_url"] = url
             captured["params"] = params
             captured["data"] = data
+            captured["headers"] = headers
             return FakeResponse([
                 _stream_frame(cid="c_1", rid="r_1", rcid="rc_1", text="answer!", status=2),
             ])
@@ -220,8 +223,9 @@ def test_generate_continues_conversation(monkeypatch):
                 "text": '{"SNlM0e":"tok123"}',
             })()
 
-        def post(self, url, params=None, data=None, stream=None, timeout=None):
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
             captured["data"] = data
+            captured["headers"] = headers
             return FakeResponse([_stream_frame(cid="c_9", rid="r_9", text="ok", status=2)])
 
     monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
@@ -657,3 +661,196 @@ def test_persist_cookies_writes_file(monkeypatch, tmp_path):
     names = {c["name"] for c in raw}
     assert names == {"__Secure-1PSID", "NID"}  # google cookies only
     assert (cookie_file.stat().st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Model selection (side-channel header + payload slots) and fallbacks
+# ---------------------------------------------------------------------------
+
+from gemini_mcp.gemini_client import (  # noqa: E402
+    MODEL_CATALOG,
+    MODEL_HEADER_KEY,
+    resolve_model_setting,
+    resolve_thinking_level,
+)
+
+
+class _ModelFakeInit:
+    status_code = 200
+    text = 'window.WIZ_global_data = {"SNlM0e":"tok","cfb2h":"bl","FdrFJe":"sid"}'
+
+
+def _model_client(monkeypatch, responses, captured, **kwargs):
+    """Client whose fake transport replays ``responses`` (frames per POST)."""
+
+    class FakeSession:
+        def __init__(self):
+            self.cookies = type("J", (), {"set": lambda *a, **k: None,
+                                          "__iter__": lambda self: iter(())})()
+            self.headers = {}
+
+        def get(self, url, **kw):
+            return _ModelFakeInit()
+
+        def post(self, url, params=None, data=None, stream=None, timeout=None, headers=None):
+            captured.append({"params": params, "data": data, "headers": headers})
+            return FakeResponse(responses[len(captured) - 1])
+
+    monkeypatch.setattr("gemini_mcp.gemini_client.requests.Session", FakeSession)
+    return GeminiWebClient({}, **kwargs)
+
+
+def _inner_of(capture):
+    return json.loads(json.loads(capture["data"]["f.req"])[1])
+
+
+def test_resolve_model_setting_names_aliases_and_legacy():
+    assert resolve_model_setting("argon").model_number == 8
+    assert resolve_model_setting("gemini-4").label == "argon"
+    assert resolve_model_setting("4-argon").label == "argon"
+    assert resolve_model_setting("pro").model_number == 3
+    assert resolve_model_setting("gemini-3.1-pro").label == "pro"
+    assert resolve_model_setting("PRO").label == "pro"
+    assert resolve_model_setting("highest").label == "argon"  # alias -> top tier
+    assert resolve_model_setting("flash").model_number == 1
+    assert resolve_model_setting("unknown-model").label == "argon"  # safe default
+    assert resolve_model_setting(None).label == "argon"  # highest by default
+    assert resolve_model_setting("legacy") is None
+    assert resolve_model_setting("off") is None
+    # capacity comes from the catalog, overridable
+    assert resolve_model_setting("pro").capacity == MODEL_CATALOG["pro"][1]
+    assert resolve_model_setting("argon").capacity == MODEL_CATALOG["argon"][1]
+    assert resolve_model_setting("pro", capacity=2).capacity == 2
+    assert resolve_model_setting("pro", capacity="bogus").capacity == 4
+
+
+def test_resolve_thinking_level():
+    assert resolve_thinking_level(1) == 1
+    assert resolve_thinking_level("standard") == 1
+    assert resolve_thinking_level("high") == 2
+    assert resolve_thinking_level("deep") == 3
+    assert resolve_thinking_level(None) == 2  # highest synchronous depth
+    assert resolve_thinking_level(9) == 2  # out-of-range -> default
+    assert resolve_thinking_level("nonsense") == 2
+
+
+def test_generate_sends_model_header_and_payload_slots(monkeypatch):
+    captured = []
+    client = _model_client(
+        monkeypatch,
+        [[_stream_frame(text="我能用", model="3.1 Pro", status=2)]],
+        captured,
+        model="pro",
+        thinking=2,
+    )
+    res = client.generate("ping")
+    assert len(captured) == 1
+    inner = _inner_of(captured[0])
+    assert len(inner) == 81
+    assert inner[79] == 3  # model number (MODE_CATEGORY: Pro)
+    assert inner[80] == 2  # thinking level (extended)
+    header = json.loads(captured[0]["headers"][MODEL_HEADER_KEY])
+    assert header[4] == MODEL_CATALOG["pro"][0]  # model id hash
+    assert header[11] == MODEL_CATALOG["pro"][1]  # capacity
+    assert header[14] == 3  # model number
+    assert header[15] == 2  # thinking level
+    assert header[16] == inner[59]  # request uuid
+    assert res.model == "3.1 Pro"
+
+
+def test_generate_legacy_model_keeps_old_request_shape(monkeypatch):
+    captured = []
+    client = _model_client(monkeypatch, [[_stream_frame(text="ok", status=2)]], captured,
+                           model="legacy")
+    client.generate("ping")
+    inner = _inner_of(captured[0])
+    assert len(inner) == 69  # historical shape, no model slots
+    assert inner[79:] == [] or all(v is None for v in inner[79:])
+    assert captured[0]["headers"] is None  # no side-channel headers
+    assert client.model_description["model"] == "legacy"
+
+
+def test_generate_falls_back_when_model_rejected(monkeypatch):
+    captured = []
+    client = _model_client(
+        monkeypatch,
+        [
+            [_stream_frame(error_code=1052)],  # Argon header unavailable
+            [_stream_frame(error_code=1052)],  # 3.1 Pro header unavailable too
+            [_stream_frame(text="fallback answer", model="3.8 Flash", status=2)],
+        ],
+        captured,
+    )
+    res = client.generate("ping")
+    assert res.text == "fallback answer"
+    assert len(captured) == 3
+    # Default chain: Argon -> 3.1 Pro -> Flash-Basic -> legacy model-less.
+    first_header = json.loads(captured[0]["headers"][MODEL_HEADER_KEY])
+    second_header = json.loads(captured[1]["headers"][MODEL_HEADER_KEY])
+    fallback_header = json.loads(captured[2]["headers"][MODEL_HEADER_KEY])
+    assert first_header[14] == 8  # Argon
+    assert first_header[4] == MODEL_CATALOG["argon"][0]
+    assert second_header[14] == 3  # 3.1 Pro
+    assert second_header[4] == MODEL_CATALOG["pro"][0]
+    assert fallback_header[4] == MODEL_CATALOG["flash-basic"][0]
+    assert fallback_header[14] == 1
+
+
+def test_generate_conversation_model_conflict_retries_legacy(monkeypatch):
+    captured = []
+    client = _model_client(
+        monkeypatch,
+        [
+            [_stream_frame(error_code=1050)],  # model inconsistent with history
+            [_stream_frame(text="legacy answer", status=2)],
+        ],
+        captured,
+    )
+    res = client.generate("ping", metadata=["c_1", "r_1", "", None, None, None,
+                                            None, None, None, ""])
+    assert res.text == "legacy answer"
+    assert len(captured) == 2
+    assert captured[1]["headers"] is None
+    assert len(_inner_of(captured[1])) == 69
+
+
+def test_environment_configures_model(monkeypatch):
+    monkeypatch.setenv("GEMINI_MODEL", "flash")
+    monkeypatch.setenv("GEMINI_THINKING", "standard")
+    monkeypatch.setenv("GEMINI_MODEL_CAPACITY", "1")
+    client = GeminiWebClient({})
+    assert client.model_setting.label == "flash"
+    assert client.model_setting.thinking == 1
+    assert client.model_setting.capacity == 1
+    assert client.model_chain[1] is not None  # fallback model
+    assert client.model_chain[-1] is None  # legacy last resort
+    desc = client.model_description
+    assert desc["model"] == "flash"
+    assert desc["thinking_level"] == 1
+
+
+def test_default_model_is_argon_with_degrade_chain(monkeypatch):
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL_FALLBACK", raising=False)
+    client = GeminiWebClient({})
+    assert client.model_description["model"] == "argon"
+    assert [p.label if p is not None else None for p in client.model_chain] == [
+        "argon",
+        "pro",
+        "flash-basic",
+        None,
+    ]
+    assert client.model_setting.model_number == 8
+    assert client.model_setting.thinking == 2
+
+
+def test_fallback_env_accepts_comma_separated_chain(monkeypatch):
+    monkeypatch.setenv("GEMINI_MODEL", "pro")
+    monkeypatch.setenv("GEMINI_MODEL_FALLBACK", "pro,flash-lite,legacy")
+    client = GeminiWebClient({})
+    assert [p.label if p is not None else None for p in client.model_chain] == [
+        "pro",
+        "flash-lite",
+        None,
+    ]
+

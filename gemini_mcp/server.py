@@ -286,6 +286,7 @@ def gemini_status() -> dict[str, Any]:
         status["ok"] = True
         status["token_fetched"] = True
         status["language"] = client.language
+        status["model"] = client.model_description
         status["session_id_present"] = bool(client.session_id)
         status["cookie_rotation"] = {
             "last_rotate_seconds_ago": (
@@ -324,7 +325,17 @@ def gemini_send_message(
 
     Returns:
         The model's answer plus conversation_id/response_id/candidate_id to
-        continue the chat later, and any web images cited in the reply.
+        continue the chat later, and any web images cited in the reply. The
+        returned ``model`` field is the model name the web server says served
+        the answer (e.g. "4 Argon High").
+
+    Model choice:
+        ``GEMINI_MODEL`` (default ``argon`` = Gemini 4 "Argon", the strongest
+        model the web UI exposes) and ``GEMINI_THINKING`` (default ``2`` =
+        extended; ``3`` = Deep Think, which answers asynchronously) configure
+        the tier. Rejections degrade Argon -> 3.1 Pro -> Flash-Basic -> the
+        model-less legacy request. ``GEMINI_MODEL=legacy`` restores the
+        pre-model-selection behaviour.
     """
     if not message or not message.strip():
         raise ValueError("message must not be empty")
