@@ -24,3 +24,8 @@ cookies*.json
 .idea/
 .vscode/
 .DS_Store
+.cache/
+pytest-of-sir_c/
+*.bak
+*.pre-model.bak
+*.pre-argon.bak

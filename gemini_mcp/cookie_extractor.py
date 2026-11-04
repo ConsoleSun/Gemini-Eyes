@@ -1,4 +1,4 @@
-"""Cookie extractor ("decompiler") for Chrome / Edge / Chromium profiles.
+﻿"""Cookie extractor ("decompiler") for Chrome / Edge / Chromium profiles.
 
 Google's browsers store session cookies in a SQLite database with values
 encrypted by the OS keychain:
@@ -134,12 +134,17 @@ class ExtractionResult:
 # Platform decryption primitives
 # ---------------------------------------------------------------------------
 
+def _platform_key() -> str:
+    """platform.system() spells Windows 'Windows'; the path tables use 'win32'."""
+    name = platform.system().lower()
+    return "win32" if name == "windows" else name
+
 def _expand(path: str) -> str:
     return os.path.expandvars(os.path.expanduser(path))
 
 
 def _local_state_path(browser: str) -> Optional[Path]:
-    spec = BROWSERS[browser]["local_state"].get(platform.system().lower())
+    spec = BROWSERS[browser]["local_state"].get(_platform_key())
     if not spec:
         return None
     p = Path(_expand(spec))
@@ -227,7 +232,7 @@ def _read_os_crypt_key_macos(browser: str) -> Optional[bytes]:
 
 
 def _get_decryption_key(browser: str, local_state: Optional[Path]) -> Optional[bytes]:
-    system = platform.system().lower()
+    system = _platform_key()
     if system == "linux":
         return _read_os_crypt_key_linux(local_state) if local_state else None
     if system == "win32":
@@ -284,7 +289,7 @@ def _is_clean(value: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _find_cookie_db(browser: str, profile: str) -> Optional[Path]:
-    system = platform.system().lower()
+    system = _platform_key()
     candidates: list[Path] = []
     spec = BROWSERS[browser]["cookies"].get(system)
     if spec:
@@ -356,7 +361,7 @@ def extract_cookies(
 
     local_state = _local_state_path(browser)
     key = _get_decryption_key(browser, local_state)
-    if not key and platform.system().lower() != "darwin":
+    if not key and _platform_key() != "darwin":
         result.errors.append(_local_state_diagnosis(local_state))
 
     db_path = _find_cookie_db(browser, profile)
@@ -466,3 +471,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

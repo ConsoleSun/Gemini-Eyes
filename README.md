@@ -79,6 +79,27 @@ dsh --profile demo
 
 DSH bundle 已把 `toolCallTimeoutMs` 设为 `600000` 毫秒（10 分钟），以覆盖 mcp-client 默认的 60 秒超时。
 
+### 4. 模型档位与思考深度（默认最高档）
+
+默认请求网页端**最高档**：Gemini 4「Argon」+ 扩展思考（extended thinking）。模型写在
+侧信道请求头 `x-goog-ext-525001261-jspb` 里——实测只改请求体 `inner[79]` 的模型槽
+**不生效**（服务端会退回账号默认的 Flash-Lite / Flash 档）；响应帧 `inner[42]` 会回报
+实际服务的模型名（thinking=2 时为 `4 Argon High`，thinking=1 时为 `4 Argon`），工具返回值的
+`model` 字段就来自这里，可用来验证。
+
+档位实测（2026-11-02）：`model_number=8` → 4 Argon，`3` → 3.1 Pro，`1` → Flash，
+`6` → 3.5 Flash-Lite；用别的 number（如 4/5/7）服务端不报错，会静默按默认 Flash-Lite 应答。
+
+| 环境变量 | 默认 | 取值 |
+|---|---|---|
+| `GEMINI_MODEL` | `argon` | `argon`（Gemini 4，网页端最强档；别名 `4-argon` / `gemini-4` / `highest`）/ `pro`（Gemini 3.1 Pro）/ `flash` / `flash-lite` / `legacy` = 旧行为：不带模型头，走网页端默认档 |
+| `GEMINI_THINKING` | `2` | `1` standard / `2` extended（**最高且能同步回答**的深度）/ `3` deep think（异步：首帧只回「处理中」占位，不建议日常用） |
+| `GEMINI_MODEL_CAPACITY` | 目录默认 | `1`–`4`，账号档位；服务端不接受时会自动降级 |
+| `GEMINI_MODEL_FALLBACK` | `pro,flash-basic` | 高档不可用（1037 额度 / 1052 模型不可用）时依次自动降级的模型链，可逗号分隔；默认 `argon → pro → flash-basic → legacy`；填 `legacy` 表示直接回退旧请求 |
+
+续聊旧对话时若服务端报 1050（模型与对话历史不一致），会自动改用不带模型头的老请求，
+旧对话继续可用。想彻底回到升级前行为：`GEMINI_MODEL=legacy`。
+
 **Claude Desktop / Cline / 其他**：标准 MCP 配置，`command` + `args` 指向
 `gemini-mcp --cookie-file /path/to/cookies.json`（stdio），或 HTTP 模式填
 `http://127.0.0.1:8900/mcp` 并带 `Authorization: Bearer <token>` 头。
